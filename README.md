@@ -25,11 +25,14 @@ OFFLINE H200 SERVER
 
 | File | Runs on | Purpose |
 |---|---|---|
+| `prepare_h200_usb.sh` | online Ubuntu 26.04 amd64 machine | **One command for everything that needs Internet.** Installs missing tools, downloads the NVIDIA file, downloads every Ubuntu package, builds and validates the ZIP, and copies it to the USB drive with a verified `.sha256`. |
+| `download_nvidia_repo.sh` | any Internet machine (Linux, macOS, Windows WSL) | Downloads the official NVIDIA local repository `.deb` into `nvidia-downloads/`, or checks a copy you downloaded with a browser (`--verify`). |
 | `build_h200_nvidia_offline_bundle.sh` | online Ubuntu 26.04 amd64 machine | Downloads, resolves, verifies, and packages everything into the ZIP. Root is **not** required, and nothing is installed or reconfigured on the build machine. |
 | `install_h200_nvidia_offline.sh` | offline H200 | Offline installer. The builder copies it into the ZIP. |
 | `capture_target_state.sh` | offline H200 (optional) | Read-only helper. Captures the H200's kernel and installed-package database so the bundle can be resolved against that exact system. The builder copies it into the ZIP. |
 
-Keep the three scripts in the same directory. The builder copies the other two into the bundle.
+Keep all scripts in the same directory. The builder copies the installer and
+`capture_target_state.sh` into the bundle.
 
 **Output file (exactly one):** `H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip`
 
@@ -49,14 +52,38 @@ H200_NVIDIA_615.71.09_Ubuntu26.04_Offline/
 
 ## 1. Commands on the online Ubuntu 26.04 machine
 
+### Everything in one command (recommended)
+
+Plug in and mount the USB drive (`lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS` shows where), then:
+
+```bash
+cd /path/to/these/scripts
+./prepare_h200_usb.sh --usb /media/$USER/<USB-LABEL> --kernel 7.0.0-38-generic
+#   --kernel: the value of `uname -r` on the H200; omit it to bundle every 7.0.0-NN-generic ABI
+```
+
+It runs these four steps and stops with a clear message if any step fails:
+
+1. **Tools.** Installs `curl zip unzip xz-utils` with `sudo apt-get` if they are missing.
+2. **NVIDIA file.** Runs `download_nvidia_repo.sh`, which downloads `nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb` into `nvidia-downloads/`. A valid copy already there is reused.
+3. **Build.** Runs `build_h200_nvidia_offline_bundle.sh`, which downloads every Ubuntu package and builds and validates the ZIP.
+4. **USB.** Copies the ZIP and `<ZIP>.sha256` to the USB drive and re-checks the SHA256 on the drive. It refuses a path that is not a mounted drive, and refuses a FAT32 drive if the ZIP is 4 GiB or larger.
+
+When it prints `READY`, nothing else has to be downloaded. Eject the drive and take it to the H200.
+
+### Step by step
+
 ```bash
 # Tools (normally already present on Ubuntu 26.04)
 sudo apt-get update
 sudo apt-get install -y git curl zip unzip xz-utils
 
-# Get the scripts
+# Get the scripts (or copy the .sh files into one folder)
 git clone https://github.com/IAMA77/h200-nvidia-offline-bundle.git
 cd h200-nvidia-offline-bundle
+
+# NVIDIA file (optional: the builder downloads it itself if it is missing)
+./download_nvidia_repo.sh
 
 # Recommended: build for the exact kernel the H200 runs (value of `uname -r` on the H200)
 ./build_h200_nvidia_offline_bundle.sh --kernel 7.0.0-38-generic
@@ -76,6 +103,7 @@ Builder options:
 | `--kernel SPEC` | `7.0.0-generic` (family, default) or an exact ABI such as `7.0.0-38-generic`. Repeatable or comma-separated. |
 | `--target-state FILE` | Archive from `capture_target_state.sh`. Selects the H200's running kernel automatically and resolves dependencies against the H200's exact package database. |
 | `--nvidia-repo-deb FILE` | Use a copy of `nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb` that you already downloaded from nvidia.com. The filename must match exactly. |
+| `--nvidia-download-dir DIR` | Folder for the NVIDIA file (default `nvidia-downloads/` next to the scripts). A valid copy there is reused; a new download is saved there. |
 | `--with-kernel-image` | Also bundle `linux-image` for the single selected ABI, so the H200 can switch to that kernel offline (installer `--install-kernel`). |
 | `--workdir DIR`, `--output-dir DIR`, `--keep-workdir` | Locations. The work directory is deleted after a successful build unless you pass `--keep-workdir`. |
 
@@ -91,6 +119,48 @@ bash ./capture_target_state.sh /tmp
 ./build_h200_nvidia_offline_bundle.sh --target-state h200_target_state_<host>_<time>.tar.gz
 ```
 
+## NVIDIA download: links, and where to put the file
+
+`download_nvidia_repo.sh` (and the builder itself) download the file automatically from
+these official NVIDIA locations. They are tried in order; the file is the same at each:
+
+* https://developer.download.nvidia.com/compute/nvidia-driver/615.71.09/local_installers/nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb
+* https://us.download.nvidia.com/tesla/615.71.09/nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb
+* https://international.download.nvidia.com/tesla/615.71.09/nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb
+
+NVIDIA pages:
+
+* **Download page:** [Data Center Driver downloads](https://developer.nvidia.com/datacenter-driver-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=26.04&target_type=deb_local). Choose Linux > x86_64 > Ubuntu > 26.04 > deb (local).
+* **Release notes:** [615.71.09 release notes](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-615-71-09/index.html)
+* **Install guide:** [Driver Installation Guide 615, Ubuntu](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/615/ubuntu.html)
+
+**If the automatic download is blocked** (corporate proxy, firewall), download the file
+yourself on any computer and put it, **without renaming it**, here:
+
+```
+<folder with the scripts>/nvidia-downloads/nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb
+```
+
+Or let the script check it and move it there:
+
+```bash
+./download_nvidia_repo.sh --verify ~/Downloads/nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/nvidia-driver/615.71.09/local_installers/nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb" -OutFile "nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb"
+Get-FileHash -Algorithm SHA256 "nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb"
+```
+
+Then run `./prepare_h200_usb.sh` (or the builder) again. It finds the file automatically.
+
+If all three URLs fail, `download_nvidia_repo.sh` prints a diagnosis per URL:
+`404` means not published there, `403` means blocked, `000` means no connection. It also
+reports, for information only, whether 615.71.09 is published for another Ubuntu release.
+Another release or driver version is never used.
+
 ## 2. Commands on the offline H200
 
 ```bash
@@ -100,9 +170,10 @@ sudo mkdir -p /mnt/usb
 sudo mount /dev/sdX1 /mnt/usb                     # your USB partition
 mkdir -p ~/h200-nvidia
 cp /mnt/usb/H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip ~/h200-nvidia/
+cp /mnt/usb/H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip.sha256 ~/h200-nvidia/   # written by prepare_h200_usb.sh
 sudo umount /mnt/usb
 cd ~/h200-nvidia
-sha256sum H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip   # compare with the online value
+sha256sum -c H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip.sha256   # must print: OK
 
 unzip H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip
 # (without unzip:  python3 -m zipfile -e H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip . )
@@ -135,7 +206,12 @@ The log is written to `install.log` in the bundle directory, or to
 
 1. **Verifies the build machine:** Ubuntu 26.04 (`/etc/os-release`), `x86_64`/dpkg `amd64`, the required tools, the Ubuntu archive keyring, free disk space, and Internet access. Internet access is proven by downloading the archive's `Release` file and checking that it reports `Version: 26.04`.
 2. **Creates a clean working directory.** It refuses to delete any directory it did not create.
-3. **Downloads `nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb`** over HTTPS from NVIDIA only. It tries `developer.download.nvidia.com/compute/nvidia-driver/615.71.09/local_installers/` first, then `us.download.nvidia.com/tesla/615.71.09/`. If neither serves the file, the build stops. It never falls back to another version or to the `.run` installer.
+3. **Obtains `nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb`.**
+   * It first uses a valid copy in `nvidia-downloads/`, checked against its `.sha256` file if present.
+   * Otherwise it downloads the file over HTTPS from NVIDIA only. It tries `developer.download.nvidia.com/compute/nvidia-driver/615.71.09/local_installers/`, then `us.download.nvidia.com/tesla/615.71.09/`, then `international.download.nvidia.com/tesla/615.71.09/`, and saves the file in `nvidia-downloads/`.
+   * If none of them serves the file, the build stops and prints the links and the exact place to put a manual download.
+
+   It never falls back to another version or to the `.run` installer.
 4. **Verifies the NVIDIA package:** it is a valid `.deb` with `Package: nvidia-driver-local-repo-ubuntu2604-615.71.09`, `Version: 1.0-1`, `Architecture: amd64`. Its SHA256 is recorded.
 5. **Extracts it with `dpkg-deb -x`** into the working directory. It is never installed on the build machine. The APT source line and signing keyring shipped inside it are reused, and the NVIDIA repository signature is verified.
 6. **Builds a private APT environment.** This is a separate `apt.conf`, sources, lists, cache and dpkg status inside the work directory. It contains:
@@ -153,11 +229,24 @@ The log is written to `install.log` in the bundle directory, or to
    | `libnvidia-compute` | `libnvidia-compute`, `libnvidia-compute-615` |
    | `nvidia-open` | `nvidia-open`, `nvidia-open-615` |
 
-   `nvidia-utils[-615]` (nvidia-smi), `nvidia-compute-utils[-615]`, `nvidia-firmware[-615[-615.71.09]]` and `nvidia-fabricmanager[-615]` are added when present. The version must be `615.71.09*`. If a required package is missing, the build stops and lists what is missing plus similar names that do exist. No name is invented.
+   These are added when present:
+   * `nvidia-utils[-615]` (nvidia-smi);
+   * `nvidia-compute-utils[-615]`;
+   * `nvidia-firmware[-615[-615.71.09]]`;
+   * `nvidia-driver-pinning-615.71.09` or `nvidia-driver-pinning-615` (NVIDIA's version lock);
+   * `nvidia-fabricmanager[-615]`.
+
+   The version must be `615.71.09*`. If a required package is missing, the build stops and lists what is missing plus similar names that do exist. No name is invented. NVIDIA's 615 installation guide confirms that, from branch 590, the Ubuntu packages are unversioned (`nvidia-open`, `libnvidia-compute`, `nvidia-dkms-open`). Those are the names tried first.
 8. **Finds the exact kernel**, never guessing. `7.0.0-generic` is a kernel *family*, not an installable package. The builder lists every `linux-headers-7.0.0-NN-generic` package in Ubuntu 26.04. With a family, it bundles all of them and reports them. With an exact ABI, that package must exist, otherwise the build stops and lists the available ABIs. If no `7.0.0-*-generic` headers exist at all, the build stops and lists the available flavours and kernel versions. On 2026-10-03 Ubuntu 26.04 provides `7.0.0-14, -15, -22, -27, -28, -29, -30, -31, -34, -38-generic`.
 9. **Finds the matching "common" headers package** from the real `Depends:` of `linux-headers-<abi>`. On Ubuntu it is named `linux-headers-7.0.0-NN`; there is no `-common` suffix. It also **detects the compiler that built each kernel** from `CONFIG_GCC_VERSION` in the headers' `.config`: today `gcc 15.2`, so `gcc-15` is bundled.
 10. **Resolves the full recursive dependency closure with APT** (see below), downloads every `.deb` with `apt-get download` (each file is hash-checked against the signed indexes), then re-checks each file's `Package`/`Version`/`Architecture`.
-11. **Inspects the NVIDIA payload.** It checks for the DKMS source and `dkms.conf` (module name and version), `/usr/bin/nvidia-smi`, GSP firmware `/lib/firmware/nvidia/615.71.09/gsp*.bin` (mandatory for open modules on Hopper), `libnvidia-ml.so` and `libcuda.so`. If any is missing, the build stops.
+11. **Inspects the NVIDIA payload.** It looks inside the bundled packages for:
+    * the DKMS source and `dkms.conf` (module name and version);
+    * `/usr/bin/nvidia-smi`;
+    * GSP firmware `/lib/firmware/nvidia/615.71.09/gsp*.bin` (mandatory for open modules on Hopper);
+    * `libnvidia-ml.so.1` and `libcuda.so.1`.
+
+    If something is missing, it searches every NVIDIA 615.71.09 package in the local repository for the file. It adds the package that ships it (marked "found by content" in `MANIFEST.txt`), resolves its dependencies, and checks again. This means an unexpected NVIDIA package name cannot silently produce a bundle without `nvidia-smi` or firmware. If a file cannot be found anywhere, the build stops.
 12. **Writes** the local APT index, `bundle.conf`, `README.txt` and `MANIFEST.txt`.
 13. **Validates the bundle** (section 5), writes and verifies `SHA256SUMS`, creates the ZIP, runs `unzip -t`, and checks that the installer, manifest, README, `SHA256SUMS` and every `.deb` are inside.
 
@@ -243,6 +332,12 @@ The scripts were exercised in this repository's development environment as follo
 
 * **Builder.** Run inside a real Ubuntu 26.04 (`resolute`) userland, against the live official Ubuntu archive. Both root and a normal user were tested. Kernel ABI discovery, common-header discovery, the gcc-15 detection, the full dependency resolution, the downloads, the validation and the ZIP creation all ran for real. That covered a single ABI, all ten `7.0.0-NN-generic` ABIs, `--target-state` and `--with-kernel-image`. The refusal paths were tested too: a non-existent kernel family, a non-existent exact ABI, a wrong NVIDIA filename, and a missing NVIDIA package.
 * **Installer.** Run on a fresh minimal Ubuntu 26.04 system **with networking removed**. It installed GCC 15, DKMS, and the real `linux-headers-7.0.0-38-generic` from the bundle only. DKMS then compiled a kernel module against those headers, and `depmod`/`modinfo` checks passed. Also tested: re-run idempotency, wrong-kernel detection, corrupt-package detection, non-root dry-run and `--install-kernel --dry-run`.
-* **Not possible there.** NVIDIA's download servers were not reachable from that environment, so a test-only stand-in for the NVIDIA local repository package was used: same layout, same signing scheme, Ubuntu-style package names. Loading the module and running `nvidia-smi` need the H200 itself.
+* **Automation tested.**
+  * `prepare_h200_usb.sh` end to end, with a mounted drive: the SHA256 was re-verified on the drive, and a non-mounted path was refused.
+  * The `nvidia-downloads/` drop folder: reused without re-downloading, and a corrupt `.sha256` was rejected.
+  * `download_nvidia_repo.sh --verify`: a wrong file name and an HTML error page saved as `.deb` were both rejected.
+  * The no-network failure path, which prints the diagnosis, the links and the target path.
+  * The content-based search: with `nvidia-smi` and the GSP firmware in unexpected packages, both were found and added.
+* **Not possible there.** NVIDIA's servers (download, docs and developer sites) are blocked by that environment's network policy. A test-only stand-in for the NVIDIA local repository package was used instead: same layout, same signing scheme. Loading the module and running `nvidia-smi` need the H200 itself.
 
   If NVIDIA has not published `615.71.09` for `ubuntu2604` at the URLs above, or names the packages differently from the table in step 7, the builder stops and says exactly what is unavailable. In that case download the file manually from nvidia.com and use `--nvidia-repo-deb`.

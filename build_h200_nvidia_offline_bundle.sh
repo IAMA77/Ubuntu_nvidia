@@ -49,7 +49,10 @@ readonly NVIDIA_REPO_DEB="${NVIDIA_REPO_PACKAGE}_${NVIDIA_REPO_PACKAGE_VERSION}_
 readonly -a NVIDIA_REPO_URLS=(
   "https://developer.download.nvidia.com/compute/nvidia-driver/${DRIVER_VERSION}/local_installers/${NVIDIA_REPO_DEB}"
   "https://us.download.nvidia.com/tesla/${DRIVER_VERSION}/${NVIDIA_REPO_DEB}"
+  "https://international.download.nvidia.com/tesla/${DRIVER_VERSION}/${NVIDIA_REPO_DEB}"
 )
+# Pre-downloaded NVIDIA files are looked up here first (see download_nvidia_repo.sh).
+readonly NVIDIA_DOWNLOAD_DIRNAME="nvidia-downloads"
 
 # Official Ubuntu archive (all three pockets of the release; no -proposed,
 # no -backports, no PPAs).
@@ -74,7 +77,7 @@ readonly ANY_DRIVER_VERSION_RE='^([0-9]+:)?[0-9]{3}\.[0-9]+(\.[0-9]+)?([-+~].*)?
 # NVIDIA package roles. The first five are mandatory (requested explicitly);
 # the others are added when the local repository provides them.
 readonly -a NVIDIA_REQUIRED_ROLES=(nvidia-dkms-open nvidia-kernel-source-open nvidia-kernel-common libnvidia-compute nvidia-open)
-readonly -a NVIDIA_OPTIONAL_ROLES=(nvidia-utils nvidia-compute-utils nvidia-firmware)
+readonly -a NVIDIA_OPTIONAL_ROLES=(nvidia-utils nvidia-compute-utils nvidia-firmware nvidia-driver-pinning)
 
 # Ubuntu toolchain packages that are bundled and installed explicitly (their
 # dependencies are collected recursively). gcc-NN matching the compiler that
@@ -93,6 +96,7 @@ WARNINGS=()
 
 KERNEL_SPECS=()
 NVIDIA_REPO_DEB_ARG=""
+NVIDIA_DOWNLOAD_DIR=""
 TARGET_STATE_ARG=""
 WITH_KERNEL_IMAGE=0
 KEEP_WORKDIR=0
@@ -122,6 +126,7 @@ TARGET_KERNEL=""
 TARGET_STATUS=""
 
 declare -A NV_VER=()            # NVIDIA local repo: package -> version (amd64/all)
+declare -A NV_FILE=()           # NVIDIA local repo: package -> Filename (relative to the repo)
 declare -A ROLE_PKG=()          # role -> real package name
 declare -A ROOT_ROLE=()         # explicitly requested package -> category
 declare -A HEADERS_COMMON=()    # kernel ABI -> linux-headers common package
@@ -133,6 +138,7 @@ declare -A PKG_REL=()           # resolved package -> release string reported by
 declare -A PKG_FILE=()          # resolved package -> .deb file name in packages/
 SELECTED_ABIS=()
 NVIDIA_ROOTS=()
+EXTRA_NVIDIA_ROOTS=()
 FABRICMANAGER_PKG=""
 TOOLCHAIN_ROOTS=()
 SECUREBOOT_ROOTS=()
@@ -226,6 +232,11 @@ Options:
   --nvidia-repo-deb FILE Use an already downloaded copy of
                          ${NVIDIA_REPO_DEB}
                          (from nvidia.com) instead of downloading it.
+  --nvidia-download-dir DIR
+                         Folder for the NVIDIA download (default:
+                         ./${NVIDIA_DOWNLOAD_DIRNAME} next to this script). A file
+                         already there is verified and reused; a new download is
+                         saved there so re-runs do not download it again.
   --with-kernel-image    Also bundle linux-image/linux-modules for the single
                          selected kernel ABI, so the H200 can be moved to that
                          kernel offline (installer option --install-kernel).
@@ -321,17 +332,18 @@ decompress_index() {
   esac
 }
 
-# Prints "name<TAB>version<TAB>architecture" for every stanza of a Packages index.
+# Prints "name<TAB>version<TAB>architecture<TAB>filename" for every stanza of a Packages index.
 parse_packages_index() {
   awk 'BEGIN { RS = ""; FS = "\n" }
        {
-         p = v = a = ""
+         p = v = a = f = ""
          for (i = 1; i <= NF; i++) {
            if ($i ~ /^Package:/)           { p = $i; sub(/^Package:[ \t]*/, "", p) }
            else if ($i ~ /^Version:/)      { v = $i; sub(/^Version:[ \t]*/, "", v) }
            else if ($i ~ /^Architecture:/) { a = $i; sub(/^Architecture:[ \t]*/, "", a) }
+           else if ($i ~ /^Filename:/)     { f = $i; sub(/^Filename:[ \t]*/, "", f) }
          }
-         if (p != "") print p "\t" v "\t" a
+         if (p != "") print p "\t" v "\t" a "\t" f
        }'
 }
 
@@ -398,6 +410,10 @@ parse_args() {
         (($# >= 2)) || die "--nvidia-repo-deb requires a file"
         NVIDIA_REPO_DEB_ARG=$2; shift 2 ;;
       --nvidia-repo-deb=*) NVIDIA_REPO_DEB_ARG=${1#*=}; shift ;;
+      --nvidia-download-dir)
+        (($# >= 2)) || die "--nvidia-download-dir requires a directory"
+        NVIDIA_DOWNLOAD_DIR=$2; shift 2 ;;
+      --nvidia-download-dir=*) NVIDIA_DOWNLOAD_DIR=${1#*=}; shift ;;
       --with-kernel-image) WITH_KERNEL_IMAGE=1; shift ;;
       --workdir)
         (($# >= 2)) || die "--workdir requires a directory"
@@ -424,6 +440,7 @@ parse_args() {
   WORKDIR=$(abs_path "${WORKDIR:-./h200_nvidia_bundle_work}")
   OUTPUT_DIR=$(abs_path "${OUTPUT_DIR:-.}")
   [[ -n $NVIDIA_REPO_DEB_ARG ]] && NVIDIA_REPO_DEB_ARG=$(abs_path "$NVIDIA_REPO_DEB_ARG")
+  NVIDIA_DOWNLOAD_DIR=$(abs_path "${NVIDIA_DOWNLOAD_DIR:-$SCRIPT_DIR/$NVIDIA_DOWNLOAD_DIRNAME}")
   [[ -n $TARGET_STATE_ARG ]] && TARGET_STATE_ARG=$(abs_path "$TARGET_STATE_ARG")
 
   # APT source entries cannot contain whitespace in paths.
@@ -558,45 +575,95 @@ verify_nvidia_repo_deb() {
   return 0
 }
 
+# If FILE.sha256 exists next to FILE (written by download_nvidia_repo.sh), it must match.
+check_sidecar_sha256() {
+  local f=$1 expected actual
+  [[ -f $f.sha256 ]] || return 0
+  expected=$(awk 'NR == 1 { print $1 }' "$f.sha256")
+  actual=$(sha256_of "$f")
+  [[ $expected == "$actual" ]]
+}
+
+nvidia_manual_download_help() {
+  printf '%s\n' \
+    "Download it on any computer with Internet access (browser, curl, wget or download_nvidia_repo.sh):" \
+    "${NVIDIA_REPO_URLS[@]/#/  }" \
+    "  (NVIDIA download page: https://developer.nvidia.com/datacenter-driver-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=26.04&target_type=deb_local)" \
+    "and save it, without renaming it, as:" \
+    "  ${NVIDIA_DOWNLOAD_DIR}/${NVIDIA_REPO_DEB}" \
+    "then run this builder again (or pass --nvidia-repo-deb /path/to/${NVIDIA_REPO_DEB})."
+}
+
 obtain_nvidia_repo_deb() {
   step "Obtaining ${NVIDIA_REPO_DEB}"
-  NVIDIA_REPO_DEB_PATH="$WORKDIR/download/$NVIDIA_REPO_DEB"
+  NVIDIA_REPO_DEB_PATH=""
 
   if [[ -n $NVIDIA_REPO_DEB_ARG ]]; then
     [[ $(basename -- "$NVIDIA_REPO_DEB_ARG") == "$NVIDIA_REPO_DEB" ]] ||
       die "--nvidia-repo-deb must point to a file named exactly ${NVIDIA_REPO_DEB}" \
         "Got: $(basename -- "$NVIDIA_REPO_DEB_ARG"). A different driver version is never substituted."
-    cp -- "$NVIDIA_REPO_DEB_ARG" "$NVIDIA_REPO_DEB_PATH"
-    NVIDIA_REPO_SOURCE="local copy supplied with --nvidia-repo-deb ($NVIDIA_REPO_DEB_ARG)"
+    check_sidecar_sha256 "$NVIDIA_REPO_DEB_ARG" ||
+      die "$NVIDIA_REPO_DEB_ARG does not match its checksum file $NVIDIA_REPO_DEB_ARG.sha256 (corrupt or incomplete copy)."
+    NVIDIA_REPO_DEB_PATH=$NVIDIA_REPO_DEB_ARG
+    NVIDIA_REPO_SOURCE="file supplied with --nvidia-repo-deb ($NVIDIA_REPO_DEB_ARG)"
     info "Using the supplied file $NVIDIA_REPO_DEB_ARG"
   else
-    local url
-    for url in "${NVIDIA_REPO_URLS[@]}"; do
-      info "Downloading from official NVIDIA location: $url"
-      info "(the file is large; this can take several minutes)"
-      if download_https "$url" "$NVIDIA_REPO_DEB_PATH.part" && verify_nvidia_repo_deb "$NVIDIA_REPO_DEB_PATH.part"; then
-        mv -f -- "$NVIDIA_REPO_DEB_PATH.part" "$NVIDIA_REPO_DEB_PATH"
-        NVIDIA_REPO_SOURCE=$url
+    # 1. A copy that was downloaded before (manually or by download_nvidia_repo.sh).
+    local candidate
+    for candidate in "$NVIDIA_DOWNLOAD_DIR/$NVIDIA_REPO_DEB" "$PWD/$NVIDIA_REPO_DEB" "$SCRIPT_DIR/$NVIDIA_REPO_DEB"; do
+      [[ -f $candidate ]] || continue
+      if ! check_sidecar_sha256 "$candidate"; then
+        warn "$candidate does not match $candidate.sha256 (incomplete or corrupt) - ignoring it"
+        continue
+      fi
+      if verify_nvidia_repo_deb "$candidate"; then
+        NVIDIA_REPO_DEB_PATH=$candidate
+        NVIDIA_REPO_SOURCE="pre-downloaded file $candidate"
+        if [[ -f $candidate.source.txt ]]; then
+          NVIDIA_REPO_SOURCE+=" ($(sed -n 's/^url=//p' "$candidate.source.txt" | sed -n 1p))"
+        fi
+        ok "Found a pre-downloaded copy: $candidate"
         break
       fi
-      rm -f -- "$NVIDIA_REPO_DEB_PATH.part"
-      info "Not available (or not a valid package) at: $url"
+      warn "$candidate exists but is not a valid ${NVIDIA_REPO_PACKAGE} package - ignoring it"
     done
-    if [[ ! -f $NVIDIA_REPO_DEB_PATH ]]; then
-      die "The NVIDIA package ${NVIDIA_REPO_DEB} could not be downloaded from any official NVIDIA location:" \
-        "${NVIDIA_REPO_URLS[@]}" \
-        "" \
-        "Possible causes:" \
-        " - NVIDIA has not published driver ${DRIVER_VERSION} as a local repository for Ubuntu ${UBUNTU_VERSION} (${UBUNTU_REPO_TAG})," \
-        " - a firewall/proxy blocks *.nvidia.com, or the NVIDIA download requires an interactive license acceptance." \
-        "If you downloaded the file manually from nvidia.com, re-run with:" \
-        "  --nvidia-repo-deb /path/to/${NVIDIA_REPO_DEB}" \
+
+    # 2. Otherwise download it from NVIDIA into the download folder (kept for re-runs).
+    if [[ -z $NVIDIA_REPO_DEB_PATH ]]; then
+      local dir=$NVIDIA_DOWNLOAD_DIR url
+      if ! mkdir -p -- "$dir" 2>/dev/null || [[ ! -w $dir ]]; then
+        dir="$WORKDIR/download"
+        info "$NVIDIA_DOWNLOAD_DIR is not writable; downloading into $dir"
+      fi
+      for url in "${NVIDIA_REPO_URLS[@]}"; do
+        info "Downloading from official NVIDIA location: $url"
+        info "(the file is large; this can take several minutes)"
+        if download_https "$url" "$dir/$NVIDIA_REPO_DEB.part" && verify_nvidia_repo_deb "$dir/$NVIDIA_REPO_DEB.part"; then
+          mv -f -- "$dir/$NVIDIA_REPO_DEB.part" "$dir/$NVIDIA_REPO_DEB"
+          (cd -- "$dir" && sha256sum -- "$NVIDIA_REPO_DEB") >"$dir/$NVIDIA_REPO_DEB.sha256"
+          printf 'url=%s\ndownloaded_utc=%s\n' "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$dir/$NVIDIA_REPO_DEB.source.txt"
+          NVIDIA_REPO_DEB_PATH="$dir/$NVIDIA_REPO_DEB"
+          NVIDIA_REPO_SOURCE=$url
+          ok "Saved to $NVIDIA_REPO_DEB_PATH (reused by later builds)"
+          break
+        fi
+        rm -f -- "$dir/$NVIDIA_REPO_DEB.part"
+        info "Not available (or not a valid package) at: $url"
+      done
+    fi
+    if [[ -z $NVIDIA_REPO_DEB_PATH ]]; then
+      local help
+      mapfile -t help < <(nvidia_manual_download_help)
+      die "The NVIDIA package ${NVIDIA_REPO_DEB} could not be downloaded from any official NVIDIA location." \
+        "Possible causes: a firewall/proxy blocks *.nvidia.com, or NVIDIA has not published driver" \
+        "${DRIVER_VERSION} as a local repository for Ubuntu ${UBUNTU_VERSION} (${UBUNTU_REPO_TAG}) at these URLs." \
+        "" "${help[@]}" "" \
         "The builder never substitutes another driver version or the .run installer."
     fi
   fi
 
   verify_nvidia_repo_deb "$NVIDIA_REPO_DEB_PATH" ||
-    die "${NVIDIA_REPO_DEB} is not a valid ${TARGET_ARCH} package named ${NVIDIA_REPO_PACKAGE} ${NVIDIA_REPO_PACKAGE_VERSION}."
+    die "${NVIDIA_REPO_DEB_PATH} is not a valid ${TARGET_ARCH} package named ${NVIDIA_REPO_PACKAGE} ${NVIDIA_REPO_PACKAGE_VERSION}."
   NVIDIA_REPO_SHA256=$(sha256_of "$NVIDIA_REPO_DEB_PATH")
   ok "Present: $NVIDIA_REPO_DEB_PATH ($(human_mib "$(size_of "$NVIDIA_REPO_DEB_PATH")"))"
   ok "Package=${NVIDIA_REPO_PACKAGE}  Version=${NVIDIA_REPO_PACKAGE_VERSION}  Architecture=${TARGET_ARCH}"
@@ -681,12 +748,13 @@ extract_nvidia_repo() {
   done < <(find "$NV_REPO_DIR" -type f \( -name Packages -o -name Packages.gz -o -name Packages.xz \) -exec dirname {} \; | sort -u)
   ((${#indexes[@]})) || die "The NVIDIA repository at $NV_REPO_DIR contains no Packages index."
 
-  local name ver arch other=0 total=0 matching=0
-  while IFS=$'\t' read -r name ver arch; do
+  local name ver arch file other=0 total=0 matching=0
+  while IFS=$'\t' read -r name ver arch file; do
     total=$((total + 1))
     if [[ $arch != "$TARGET_ARCH" && $arch != all ]]; then other=$((other + 1)); continue; fi
     if [[ -n ${NV_VER[$name]:-} ]] && dpkg --compare-versions "${NV_VER[$name]}" ge "$ver"; then continue; fi
     NV_VER[$name]=$ver
+    NV_FILE[$name]=$file
   done < <(for f in "${indexes[@]}"; do decompress_index "$f"; printf '\n'; done | parse_packages_index)
 
   for name in "${!NV_VER[@]}"; do
@@ -810,6 +878,7 @@ role_candidates() {
     nvidia-compute-utils) echo "nvidia-compute-utils nvidia-compute-utils-$b" ;;
     nvidia-firmware) echo "nvidia-firmware nvidia-firmware-$b nvidia-firmware-$b-$v" ;;
     nvidia-fabricmanager) echo "nvidia-fabricmanager nvidia-fabricmanager-$b" ;;
+    nvidia-driver-pinning) echo "nvidia-driver-pinning-$v nvidia-driver-pinning-$b" ;;
     *) return 1 ;;
   esac
 }
@@ -1131,6 +1200,7 @@ resolve_dependencies() {
   [[ -n $FABRICMANAGER_PKG ]] && roots+=("$FABRICMANAGER_PKG")
   info "Explicit packages (${#roots[@]}): ${roots[*]}"
   local sim tsv
+  RESOLUTION_PASSES=()
 
   # Pass 1: against an EMPTY dpkg database. Nothing is assumed to be installed,
   # so every Depends/Pre-Depends of every package is followed recursively.
@@ -1178,9 +1248,13 @@ download_packages() {
   step "Downloading ${#PKG_VER[@]} packages (APT verifies every file against the signed indexes)"
   local -a specs
   local name
-  mapfile -t specs < <(for name in "${!PKG_VER[@]}"; do printf '%s=%s\n' "$name" "${PKG_VER[$name]}"; done | sort)
-  if ! (cd -- "$PKG_DIR" && printf '%s\0' "${specs[@]}" | xargs -0 -n 40 apt-get -c "$APT_CONF" -q download); then
-    die "Downloading packages failed (see the APT messages above)."
+  mapfile -t specs < <(for name in "${!PKG_VER[@]}"; do
+    [[ -f $PKG_DIR/$(deb_filename "$name" "${PKG_VER[$name]}" "${PKG_ARCH[$name]}") ]] || printf '%s=%s\n' "$name" "${PKG_VER[$name]}"
+  done | sort)
+  if ((${#specs[@]})); then
+    if ! (cd -- "$PKG_DIR" && printf '%s\0' "${specs[@]}" | xargs -0 -n 40 apt-get -c "$APT_CONF" -q download); then
+      die "Downloading packages failed (see the APT messages above)."
+    fi
   fi
 
   local f ver arch problems=()
@@ -1211,48 +1285,126 @@ download_packages() {
   ok "${#PKG_FILE[@]} packages downloaded and verified ($(human_mib "$total"))"
 }
 
-inspect_nvidia_payload() {
-  step "Inspecting the NVIDIA packages (DKMS source, nvidia-smi, GSP firmware, NVML, CUDA driver library)"
-  local name f listing dkms_conf_path=""
-  local fw_re="\./(usr/)?lib/firmware/nvidia/${DRIVER_VERSION//./\\.}/gsp[^/]*\.bin"
+deb_listing() { dpkg-deb -c -- "$1" | awk '{ for (i = 6; i <= NF; i++) if ($i ~ /^\.\//) { print $i; break } }'; }
+
+# What the NVIDIA part of the bundle must contain, as patterns on .deb file lists.
+payload_pattern() {
+  case $1 in
+    dkms) printf '%s\n' '^\./usr/src/[^/]+/dkms\.conf$' ;;
+    smi) printf '%s\n' '^\./usr/bin/nvidia-smi$' ;;
+    gsp) printf '%s\n' "^\\./(usr/)?lib/firmware/nvidia/${DRIVER_VERSION//./\\.}/gsp[^/]*\\.bin\$" ;;
+    nvml) printf '%s\n' '/libnvidia-ml\.so\.[0-9]' ;;
+    cuda) printf '%s\n' '/libcuda\.so\.[0-9]' ;;
+  esac
+}
+payload_label() {
+  case $1 in
+    dkms) echo "DKMS kernel module source (/usr/src/*/dkms.conf)" ;;
+    smi) echo "/usr/bin/nvidia-smi" ;;
+    gsp) echo "GSP firmware /lib/firmware/nvidia/${DRIVER_VERSION}/gsp*.bin (mandatory for open kernel modules on H200)" ;;
+    nvml) echo "NVML library libnvidia-ml.so.1 (needed by nvidia-smi)" ;;
+    cuda) echo "CUDA driver library libcuda.so.1 (CUDA compute)" ;;
+  esac
+}
+readonly -a PAYLOAD_KEYS=(dkms smi gsp nvml cuda)
+declare -A PAYLOAD_PKG=()
+PAYLOAD_MISSING=()
+DKMS_CONF_PATH=""
+
+scan_payload() {
+  local name f listing key
+  PAYLOAD_PKG=()
+  PAYLOAD_MISSING=()
   for name in $(printf '%s\n' "${!PKG_FILE[@]}" | sort); do
     [[ -n ${NV_VER[$name]:-} ]] || continue
     f="$PKG_DIR/${PKG_FILE[$name]}"
-    listing=$(dpkg-deb -c -- "$f" | awk '{ for (i = 6; i <= NF; i++) if ($i ~ /^\.\//) { print $i; break } }')
-    if [[ -z $dkms_conf_path ]] && grep -qE '^\./usr/src/[^/]+/dkms\.conf$' <<<"$listing"; then
-      dkms_conf_path=$(grep -E '^\./usr/src/[^/]+/dkms\.conf$' <<<"$listing" | sed -n 1p)
-      DKMS_CONF_PKG=$name
-      local tmpd="$WORKDIR/tmp/dkms-inspect"
-      mkdir -p -- "$tmpd"
-      dpkg-deb -x -- "$f" "$tmpd"
-      local conf="$tmpd/${dkms_conf_path#./}" srcdir pn pv
-      srcdir=$(basename -- "$(dirname -- "$conf")")
-      pn=$(sed -n -E "s/^[[:space:]]*PACKAGE_NAME=[\"']?([^\"' ]+)[\"']?.*/\1/p" "$conf" | sed -n 1p)
-      pv=$(sed -n -E "s/^[[:space:]]*PACKAGE_VERSION=[\"']?([^\"' ]+)[\"']?.*/\1/p" "$conf" | sed -n 1p)
-      [[ -n $pn && $pn != *'$'* && $pn != *'#'* ]] || pn=${srcdir%-*}
-      [[ -n $pv && $pv != *'$'* && $pv != *'#'* ]] || pv=${srcdir##*-}
-      DKMS_MODULE_NAME=$pn
-      DKMS_MODULE_VERSION=$pv
-      rm -rf -- "$tmpd"
-    fi
-    if [[ -z $NVIDIA_SMI_PKG ]] && grep -qE '^\./usr/bin/nvidia-smi$' <<<"$listing"; then NVIDIA_SMI_PKG=$name; fi
-    if [[ -z $GSP_FIRMWARE_PKG ]] && grep -qE "^${fw_re}\$" <<<"$listing"; then GSP_FIRMWARE_PKG=$name; fi
-    if [[ -z $NVML_PKG ]] && grep -qE '/libnvidia-ml\.so' <<<"$listing"; then NVML_PKG=$name; fi
-    if [[ -z $LIBCUDA_PKG ]] && grep -qE '/libcuda\.so' <<<"$listing"; then LIBCUDA_PKG=$name; fi
+    listing=$(deb_listing "$f")
+    for key in "${PAYLOAD_KEYS[@]}"; do
+      [[ -z ${PAYLOAD_PKG[$key]:-} ]] || continue
+      if grep -qE "$(payload_pattern "$key")" <<<"$listing"; then
+        PAYLOAD_PKG[$key]=$name
+        [[ $key == dkms ]] && DKMS_CONF_PATH=$(grep -E "$(payload_pattern dkms)" <<<"$listing" | sed -n 1p)
+      fi
+    done
   done
+  for key in "${PAYLOAD_KEYS[@]}"; do
+    [[ -n ${PAYLOAD_PKG[$key]:-} ]] || PAYLOAD_MISSING+=("$key")
+  done
+}
 
-  local problems=()
-  if [[ -n $DKMS_CONF_PKG ]]; then
-    ok "DKMS module ${DKMS_MODULE_NAME}/${DKMS_MODULE_VERSION} (${dkms_conf_path#.} in ${DKMS_CONF_PKG})"
-    [[ $DKMS_MODULE_VERSION == "$DRIVER_VERSION"* ]] || problems+=("DKMS module version is '$DKMS_MODULE_VERSION', expected ${DRIVER_VERSION}")
-  else
-    problems+=("no NVIDIA package in the bundle provides /usr/src/*/dkms.conf (DKMS kernel module source)")
+# Looks inside the NVIDIA repository for the packages that ship what is missing.
+repair_payload() {
+  local name f listing key added=()
+  declare -A resolved=()
+  info "Searching all NVIDIA ${DRIVER_VERSION} packages for: ${PAYLOAD_MISSING[*]}"
+  for name in $(printf '%s\n' "${!NV_VER[@]}" | sort); do
+    [[ ${NV_VER[$name]} =~ $DRIVER_VERSION_RE ]] || continue
+    [[ -z ${PKG_FILE[$name]:-} && -n ${NV_FILE[$name]:-} ]] || continue
+    f="$NV_REPO_DIR/${NV_FILE[$name]#./}"
+    [[ -f $f ]] || continue
+    listing=$(deb_listing "$f")
+    for key in "${PAYLOAD_MISSING[@]}"; do
+      [[ -z ${resolved[$key]:-} ]] || continue
+      if grep -qE "$(payload_pattern "$key")" <<<"$listing"; then
+        resolved[$key]=$name
+        if ! in_list "$name" "${added[@]}"; then
+          added+=("$name")
+          ROOT_ROLE[$name]="nvidia (provides $(payload_label "$key"))"
+        fi
+        ok "$(payload_label "$key") is shipped by $name"
+      fi
+    done
+  done
+  ((${#added[@]})) || return 1
+  NVIDIA_ROOTS+=("${added[@]}")
+  EXTRA_NVIDIA_ROOTS+=("${added[@]}")
+  return 0
+}
+
+inspect_nvidia_payload() {
+  step "Inspecting the NVIDIA packages (DKMS source, nvidia-smi, GSP firmware, NVML, CUDA driver library)"
+  scan_payload
+  if ((${#PAYLOAD_MISSING[@]})); then
+    info "Not provided by the selected packages and their dependencies: ${PAYLOAD_MISSING[*]}"
+    if repair_payload; then
+      info "Adding NVIDIA package(s) ${EXTRA_NVIDIA_ROOTS[*]} and resolving their dependencies"
+      resolve_dependencies
+      download_packages
+      step "Re-inspecting the NVIDIA packages"
+      scan_payload
+    fi
   fi
-  if [[ -n $NVIDIA_SMI_PKG ]]; then ok "nvidia-smi provided by ${NVIDIA_SMI_PKG}"; else problems+=("no bundled package provides /usr/bin/nvidia-smi"); fi
-  if [[ -n $GSP_FIRMWARE_PKG ]]; then ok "GSP firmware ${DRIVER_VERSION} provided by ${GSP_FIRMWARE_PKG}"; else problems+=("no bundled package provides GSP firmware /lib/firmware/nvidia/${DRIVER_VERSION}/gsp*.bin (mandatory for open kernel modules on H200)"); fi
-  if [[ -n $NVML_PKG ]]; then ok "NVML (libnvidia-ml.so) provided by ${NVML_PKG}"; else problems+=("no bundled package provides libnvidia-ml.so (needed by nvidia-smi)"); fi
-  if [[ -n $LIBCUDA_PKG ]]; then ok "CUDA driver library (libcuda.so) provided by ${LIBCUDA_PKG}"; else problems+=("no bundled package provides libcuda.so (CUDA compute)"); fi
+
+  local key problems=()
+  for key in "${PAYLOAD_KEYS[@]}"; do
+    if [[ -n ${PAYLOAD_PKG[$key]:-} ]]; then
+      ok "$(payload_label "$key"): ${PAYLOAD_PKG[$key]}"
+    else
+      problems+=("not found in any NVIDIA ${DRIVER_VERSION} package: $(payload_label "$key")")
+    fi
+  done
   ((${#problems[@]} == 0)) || die "The NVIDIA package set is incomplete:" "${problems[@]}"
+
+  DKMS_CONF_PKG=${PAYLOAD_PKG[dkms]}
+  NVIDIA_SMI_PKG=${PAYLOAD_PKG[smi]}
+  GSP_FIRMWARE_PKG=${PAYLOAD_PKG[gsp]}
+  NVML_PKG=${PAYLOAD_PKG[nvml]}
+  LIBCUDA_PKG=${PAYLOAD_PKG[cuda]}
+  local tmpd="$WORKDIR/tmp/dkms-inspect"
+  mkdir -p -- "$tmpd"
+  dpkg-deb -x -- "$PKG_DIR/${PKG_FILE[$DKMS_CONF_PKG]}" "$tmpd"
+  local conf="$tmpd/${DKMS_CONF_PATH#./}" srcdir pn pv
+  srcdir=$(basename -- "$(dirname -- "$conf")")
+  pn=$(sed -n -E "/^[[:space:]]*PACKAGE_NAME=/{s/^[[:space:]]*PACKAGE_NAME=[\"']?([^\"' ]+)[\"']?.*/\1/p;q}" "$conf")
+  pv=$(sed -n -E "/^[[:space:]]*PACKAGE_VERSION=/{s/^[[:space:]]*PACKAGE_VERSION=[\"']?([^\"' ]+)[\"']?.*/\1/p;q}" "$conf")
+  [[ -n $pn && $pn != *'$'* && $pn != *'#'* ]] || pn=${srcdir%-*}
+  [[ -n $pv && $pv != *'$'* && $pv != *'#'* ]] || pv=${srcdir##*-}
+  DKMS_MODULE_NAME=$pn
+  DKMS_MODULE_VERSION=$pv
+  rm -rf -- "$tmpd"
+  [[ $DKMS_MODULE_VERSION == "$DRIVER_VERSION"* ]] ||
+    die "The DKMS module version is '$DKMS_MODULE_VERSION' (${DKMS_CONF_PATH#.} in ${DKMS_CONF_PKG}), expected ${DRIVER_VERSION}."
+  ok "DKMS module ${DKMS_MODULE_NAME}/${DKMS_MODULE_VERSION} (${DKMS_CONF_PATH#.} in ${DKMS_CONF_PKG})"
 }
 
 # -----------------------------------------------------------------------------
@@ -1282,6 +1434,16 @@ build_repo_index() {
 # -----------------------------------------------------------------------------
 # Bundle metadata, installer, README, MANIFEST
 # -----------------------------------------------------------------------------
+# NVIDIA packages the installer installs (Fabric Manager is handled separately).
+nvidia_install_list() {
+  local role out=()
+  for role in "${NVIDIA_REQUIRED_ROLES[@]}" "${NVIDIA_OPTIONAL_ROLES[@]}"; do
+    [[ -n ${ROLE_PKG[$role]:-} ]] && out+=("${ROLE_PKG[$role]}")
+  done
+  out+=("${EXTRA_NVIDIA_ROOTS[@]}")
+  printf '%s\n' "${out[@]}"
+}
+
 kernel_compiler_map() {
   local abi out=()
   for abi in "${SELECTED_ABIS[@]}"; do out+=("$abi:${KERNEL_GCC_PKG[$abi]}"); done
@@ -1289,10 +1451,8 @@ kernel_compiler_map() {
 }
 
 write_bundle_conf() {
-  local nv_install=() role
-  for role in "${NVIDIA_REQUIRED_ROLES[@]}" "${NVIDIA_OPTIONAL_ROLES[@]}"; do
-    [[ -n ${ROLE_PKG[$role]:-} ]] && nv_install+=("${ROLE_PKG[$role]}")
-  done
+  local -a nv_install
+  mapfile -t nv_install < <(nvidia_install_list)
   cat >"$STAGE_DIR/bundle.conf" <<EOF
 # Generated by ${SCRIPT_NAME} ${SCRIPT_VERSION}. Read by ${INSTALLER_NAME}. Do not edit
 # (the file is covered by SHA256SUMS).
@@ -1325,10 +1485,8 @@ copy_scripts() {
 write_readme() {
   local abi kl=""
   for abi in "${SELECTED_ABIS[@]}"; do kl+="      ${abi}"$'\n'; done
-  local nv_install=() role
-  for role in "${NVIDIA_REQUIRED_ROLES[@]}" "${NVIDIA_OPTIONAL_ROLES[@]}"; do
-    [[ -n ${ROLE_PKG[$role]:-} ]] && nv_install+=("${ROLE_PKG[$role]}")
-  done
+  local -a nv_install
+  mapfile -t nv_install < <(nvidia_install_list)
   local kimg_text="This bundle does not contain kernel images."
   if ((${#KERNEL_IMAGE_PKGS[@]})); then
     kimg_text="This bundle also contains kernel ${SELECTED_ABIS[0]} (${KERNEL_IMAGE_PKGS[*]}).
@@ -1377,11 +1535,12 @@ OFFLINE INSTALLATION - EXACT STEPS
          lsblk
          sudo mkdir -p /mnt/usb
          sudo mount /dev/sdX1 /mnt/usb          # replace sdX1 with your USB partition
-         mkdir -p ~/h200-nvidia && cp /mnt/usb/${ZIP_NAME} ~/h200-nvidia/
+         mkdir -p ~/h200-nvidia && cp /mnt/usb/${ZIP_NAME}* ~/h200-nvidia/
          sudo umount /mnt/usb
 
-  3. Unzip:
+  3. Check and unzip:
          cd ~/h200-nvidia
+         sha256sum -c ${ZIP_NAME}.sha256      # if prepare_h200_usb.sh wrote it; must print OK
          unzip ${ZIP_NAME}
      If 'unzip' is not installed on the H200, use Python (always present on Ubuntu Server):
          python3 -m zipfile -e ${ZIP_NAME} .
@@ -1471,6 +1630,9 @@ write_manifest() {
     done
     [[ -n ${TARGET_KERNEL} ]] && echo "H200 target state  : running kernel ${TARGET_KERNEL} (captured with ${CAPTURE_NAME})"
     echo "DKMS module        : ${DKMS_MODULE_NAME}/${DKMS_MODULE_VERSION} (from ${DKMS_CONF_PKG})"
+    echo "nvidia-smi         : ${NVIDIA_SMI_PKG}"
+    echo "GSP firmware       : ${GSP_FIRMWARE_PKG}"
+    echo "NVML / libcuda     : ${NVML_PKG} / ${LIBCUDA_PKG}"
     echo "Packages           : ${#PKG_FILE[@]} files, $(human_mib "$total")"
     echo "Dependency resolution (APT, Depends + Pre-Depends, Recommends/Suggests excluded):"
     local p
@@ -1484,6 +1646,10 @@ write_manifest() {
       else
         printf '  %-27s -> (not a separate package in this NVIDIA release)\n' "$role2"
       fi
+    done
+    local extra
+    for extra in "${EXTRA_NVIDIA_ROOTS[@]}"; do
+      printf '  %-27s -> %s %s\n' "(found by content)" "$extra" "${NV_VER[$extra]}"
     done
     echo
     echo "PACKAGES (columns separated by ' | ')"
@@ -1580,10 +1746,8 @@ validate_bundle() {
 
   # 6. offline installability using ONLY the bundle as package source
   setup_verify_apt
-  local -a nv_install=()
-  for role in "${NVIDIA_REQUIRED_ROLES[@]}" "${NVIDIA_OPTIONAL_ROLES[@]}"; do
-    [[ -n ${ROLE_PKG[$role]:-} ]] && nv_install+=("${ROLE_PKG[$role]}")
-  done
+  local -a nv_install
+  mapfile -t nv_install < <(nvidia_install_list)
   local -a base=("${TOOLCHAIN_REQUIRED[@]}" "${nv_install[@]}" "${SECUREBOOT_ROOTS[@]}")
   [[ -n $FABRICMANAGER_PKG ]] && base+=("$FABRICMANAGER_PKG")
   local out

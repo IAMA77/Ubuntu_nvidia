@@ -253,12 +253,15 @@ EOF
 # -----------------------------------------------------------------------------
 # Generic helpers
 # -----------------------------------------------------------------------------
+# Canonical absolute path ("/.", "//", "a/../b" normalised); the path need not exist.
 abs_path() {
   local p=$1
-  [[ $p == /* ]] || p="$PWD/${p#./}"
-  [[ $p == */. ]] && p=${p%/.}
-  printf '%s\n' "$p"
+  [[ $p == /* ]] || p="$PWD/$p"
+  realpath -m -s -- "$p"
 }
+
+# True if path $1 is $2 or inside $2.
+path_within() { [[ $1 == "$2" || $1 == "$2"/* ]]; }
 
 os_release_value() {
   local key=$1 file=$2 k v
@@ -378,7 +381,7 @@ parse_simulation() {
       print "Inst\t" name "\t" ver "\t" arch "\t" rel
     }
     /^Remv / {
-      name = $2; sub(/:.*$/, "", name)
+      name = $2
       ver = $3; gsub(/[][]/, "", ver)
       print "Remv\t" name "\t" ver "\t\t"
     }' "$1"
@@ -445,7 +448,17 @@ parse_args() {
 
   # APT source entries cannot contain whitespace in paths.
   [[ $WORKDIR =~ [[:space:]] ]] && die "The working directory path must not contain whitespace: '$WORKDIR'" "Use --workdir with a path without spaces."
-  [[ $WORKDIR == / ]] && die "Refusing to use / as working directory."
+  [[ -z $WORKDIR || $WORKDIR == / ]] && die "Refusing to use / as working directory."
+  # The working directory is wiped when a build starts and deleted after success.
+  local what path
+  for what in "--output-dir:$OUTPUT_DIR" "--nvidia-download-dir:$NVIDIA_DOWNLOAD_DIR" "--nvidia-repo-deb:$NVIDIA_REPO_DEB_ARG" "--target-state:$TARGET_STATE_ARG"; do
+    path=${what#*:}
+    [[ -n $path ]] || continue
+    if path_within "$path" "$WORKDIR"; then
+      die "${what%%:*} ($path) is inside the working directory $WORKDIR," \
+        "which is wiped when a build starts and deleted after a successful build. Use a location outside it."
+    fi
+  done
   return 0
 }
 
@@ -491,7 +504,9 @@ check_build_host() {
 
   local free_kib parent
   parent=$(dirname -- "$WORKDIR")
-  mkdir -p -- "$parent" "$OUTPUT_DIR"
+  mkdir -p -- "$parent" "$OUTPUT_DIR" 2>/dev/null || true
+  [[ -d $OUTPUT_DIR && -w $OUTPUT_DIR ]] || die "The output directory $OUTPUT_DIR cannot be created or is not writable."
+  [[ -d $parent && -w $parent ]] || die "Cannot create the working directory under $parent (not writable)."
   free_kib=$(df -Pk -- "$parent" | awk 'NR==2 {print $4}')
   if [[ $free_kib =~ ^[0-9]+$ ]] && ((free_kib < MIN_FREE_KIB)); then
     die "Not enough free disk space in $parent: $((free_kib / 1024)) MiB free, at least $((MIN_FREE_KIB / 1024)) MiB needed."
@@ -566,6 +581,11 @@ verify_nvidia_repo_deb() {
   local f=$1 pkg ver arch
   [[ -s $f ]] || return 1
   dpkg-deb --info -- "$f" >/dev/null 2>&1 || return 1
+  # Reads the whole data archive: catches truncated / partially downloaded files.
+  if ! dpkg-deb --fsys-tarfile -- "$f" >/dev/null 2>&1; then
+    warn "$f is truncated or corrupt (incomplete download?)"
+    return 1
+  fi
   pkg=$(deb_field "$f" Package)
   ver=$(deb_field "$f" Version)
   arch=$(deb_field "$f" Architecture)
@@ -644,7 +664,11 @@ obtain_nvidia_repo_deb() {
           printf 'url=%s\ndownloaded_utc=%s\n' "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$dir/$NVIDIA_REPO_DEB.source.txt"
           NVIDIA_REPO_DEB_PATH="$dir/$NVIDIA_REPO_DEB"
           NVIDIA_REPO_SOURCE=$url
-          ok "Saved to $NVIDIA_REPO_DEB_PATH (reused by later builds)"
+          if [[ $dir == "$NVIDIA_DOWNLOAD_DIR" ]]; then
+            ok "Saved to $NVIDIA_REPO_DEB_PATH (reused by later builds)"
+          else
+            ok "Saved to $NVIDIA_REPO_DEB_PATH (inside the working directory: deleted after the build; make $NVIDIA_DOWNLOAD_DIR writable to keep it)"
+          fi
           break
         fi
         rm -f -- "$dir/$NVIDIA_REPO_DEB.part"
@@ -677,7 +701,9 @@ extract_nvidia_repo() {
   step "Extracting the NVIDIA local repository into the working directory (not installed on this machine)"
   NV_ROOT="$WORKDIR/nvidia-local-repo"
   mkdir -p -- "$NV_ROOT"
-  dpkg-deb -x -- "$NVIDIA_REPO_DEB_PATH" "$NV_ROOT"
+  dpkg-deb -x -- "$NVIDIA_REPO_DEB_PATH" "$NV_ROOT" ||
+    die "Cannot extract $NVIDIA_REPO_DEB_PATH (truncated or corrupt?)." \
+      "Delete it (and its .sha256 file) and run the builder again to download it anew."
 
   # Use the APT source definition shipped inside the package itself.
   local re='^[[:space:]]*deb[[:space:]]+(\[([^]]*)\][[:space:]]+)?([^[:space:]]+)[[:space:]]+([^[:space:]]+)([[:space:]]+(.*))?$'
@@ -1064,7 +1090,7 @@ select_kernels() {
     while IFS= read -r item; do
       item=${item## }
       item=${item%% *}
-      if [[ $item =~ ^linux-headers-[0-9] && $item != "linux-headers-$abi" ]]; then common=$item; break; fi
+      if [[ $item =~ ^linux-([a-z0-9.-]+-)?headers-[0-9] && $item != "linux-headers-$abi" ]]; then common=$item; break; fi
     done < <(tr ',' '\n' <<<"$deps")
     [[ -n $common ]] || die "Could not determine the common headers package of linux-headers-$abi from its Depends: $deps"
     HEADERS_COMMON[$abi]=$common
@@ -1540,13 +1566,15 @@ OFFLINE INSTALLATION - EXACT STEPS
 
   3. Check and unzip:
          cd ~/h200-nvidia
-         sha256sum -c ${ZIP_NAME}.sha256      # if prepare_h200_usb.sh wrote it; must print OK
+         sha256sum -c ${ZIP_NAME}.sha256      # must print OK (file written by prepare_h200_usb.sh;
+                                              # otherwise compare 'sha256sum ${ZIP_NAME}' with the build value)
          unzip ${ZIP_NAME}
      If 'unzip' is not installed on the H200, use Python (always present on Ubuntu Server):
          python3 -m zipfile -e ${ZIP_NAME} .
+     Then change into the bundle directory (all following commands run there):
+         cd ${BUNDLE_NAME}
 
   4. (Optional, changes nothing) check the bundle and simulate the installation:
-         cd ${BUNDLE_NAME}
          sudo bash ./${INSTALLER_NAME} --dry-run
 
   5. Install:
@@ -1581,7 +1609,8 @@ INSTALLER OPTIONS
 
 INSTALLER EXIT CODES
    0 success                         20 dependency/apt/dpkg failure
-   2 bad usage                       21 kernel headers missing
+   1 unexpected error (see log)      21 kernel headers missing
+   2 bad usage / not root
    3 reboot required                 30 DKMS build failure
   10 wrong Ubuntu version/arch       31 Secure Boot / module signing problem
   11 wrong running kernel            32 NVIDIA module failed to load
@@ -1773,7 +1802,15 @@ validate_bundle() {
     abi=${SELECTED_ABIS[0]}
     out="$WORKDIR/verify-h200-state.txt"
     if simulate_bundle_only "$TARGET_STATUS" "$out" "${base[@]}" "${KERNEL_GCC_PKG[$abi]}" "linux-headers-$abi"; then
-      ok "Offline install simulation against the captured H200 package state: OK"
+      local removed_other removed_nv
+      removed_other=$(awk '/^Remv / && $2 !~ /^(lib)?nvidia/ { printf "%s ", $2 }' "$out")
+      removed_nv=$(awk '/^Remv / && $2 ~ /^(lib)?nvidia/ { printf "%s ", $2 }' "$out")
+      if [[ -n $removed_other ]]; then
+        vfail "On the captured H200 the installation would REMOVE non-NVIDIA packages: $removed_other(upgrade or remove them on the H200 first, e.g. foreign-architecture :i386 packages)"
+      else
+        ok "Offline install simulation against the captured H200 package state: OK"
+      fi
+      [[ -z $removed_nv ]] || warn "On the H200 these NVIDIA packages of another driver would be removed: $removed_nv(the installer requires --replace-existing-driver for that)"
     else
       tail -n 30 "$out" >&2
       vfail "Offline install simulation against the captured H200 state FAILED (see $out)"

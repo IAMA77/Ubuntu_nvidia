@@ -48,7 +48,35 @@ die() {
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-usage() { sed -n '3,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Prints the comment block at the top of this file.
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; }
+
+readonly EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+# SHA256 of FILE read from the device rather than from the page cache.
+# Prints "<sha256> <method>"; returns 1 if the cache cannot be bypassed.
+uncached_sha256() {
+  local f=$1 dd_bin sha
+  # O_DIRECT read. Ubuntu 26.04's default (uutils) dd rejects iflag=direct; GNU dd is "gnudd" there.
+  for dd_bin in gnudd dd; do
+    have "$dd_bin" || continue
+    if sha=$("$dd_bin" if="$f" iflag=direct bs=4M status=none 2>/dev/null | sha256sum | awk '{print $1}') &&
+      [[ -n $sha && $sha != "$EMPTY_SHA256" ]]; then
+      printf '%s %s\n' "$sha" "direct read from the drive"
+      return 0
+    fi
+  done
+  # Otherwise evict the (already synced, clean) file pages from the cache, then read it again.
+  if have python3 && python3 -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+os.close(fd)' "$f" 2>/dev/null; then
+    sha=$(sha256sum -- "$f" | awk '{print $1}')
+    printf '%s %s\n' "$sha" "re-read after evicting it from the page cache"
+    return 0
+  fi
+  return 1
+}
 
 while (($#)); do
   case $1 in
@@ -65,7 +93,8 @@ while (($#)); do
   esac
 done
 OUTPUT_DIR=${OUTPUT_DIR:-$PWD}
-[[ $OUTPUT_DIR == /* ]] || OUTPUT_DIR="$PWD/${OUTPUT_DIR#./}"
+[[ $OUTPUT_DIR == /* ]] || OUTPUT_DIR="$PWD/$OUTPUT_DIR"
+OUTPUT_DIR=$(realpath -m -s -- "$OUTPUT_DIR")
 
 for f in build_h200_nvidia_offline_bundle.sh "$INSTALLER_NAME" capture_target_state.sh download_nvidia_repo.sh; do
   [[ -f $SCRIPT_DIR/$f ]] || die 2 "$f must be in the same folder as prepare_h200_usb.sh ($SCRIPT_DIR)"
@@ -80,6 +109,16 @@ if [[ -n $USB_DIR ]]; then
     die 2 "$USB_DIR is on the system disk, not on a mounted USB drive." \
       "Mount the USB drive (it usually appears under /media/\$USER/) and pass that path to --usb." \
       "Check with: lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS"
+  if have findmnt; then
+    usb_src=$(findmnt -n -o SOURCE --target "$USB_DIR" 2>/dev/null || true)
+    usb_fs=$(findmnt -n -o FSTYPE --target "$USB_DIR" 2>/dev/null || true)
+    case $usb_fs in
+      tmpfs | ramfs | devtmpfs | overlay | squashfs | proc | sysfs)
+        die 2 "$USB_DIR is on a $usb_fs file system, not on a USB drive." "Mount the USB drive and pass its mount point to --usb." ;;
+    esac
+    [[ -z $usb_src || $usb_src == /dev/* ]] ||
+      die 2 "$USB_DIR is on '$usb_src', which is not a local block device (USB drive)." "Mount the USB drive and pass its mount point to --usb."
+  fi
   [[ -w $USB_DIR ]] || die 2 "$USB_DIR is not writable (mounted read-only, or owned by another user)."
 fi
 
@@ -96,13 +135,17 @@ for t in "${!tool_pkg[@]}"; do have "$t" || missing_pkgs+=("${tool_pkg[$t]}"); d
 have curl || have wget || missing_pkgs+=(curl)
 if ((${#missing_pkgs[@]})); then
   echo "Installing missing tools: ${missing_pkgs[*]}"
-  if ((EUID == 0)); then
-    apt-get update && apt-get install -y "${missing_pkgs[@]}"
-  elif have sudo; then
-    sudo apt-get update && sudo apt-get install -y "${missing_pkgs[@]}"
-  else
-    die 2 "Missing tools: ${missing_pkgs[*]}" "Install them as root: apt-get install -y ${missing_pkgs[*]}"
+  sudo_cmd=()
+  if ((EUID != 0)); then
+    have sudo || die 2 "Missing tools: ${missing_pkgs[*]}" "Install them as root: apt-get install -y ${missing_pkgs[*]}"
+    sudo_cmd=(sudo)
   fi
+  { "${sudo_cmd[@]}" apt-get update && "${sudo_cmd[@]}" apt-get install -y "${missing_pkgs[@]}"; } ||
+    die 2 "Installing the missing tools failed: ${missing_pkgs[*]}" "Fix APT (sudo apt-get update) and run this script again."
+  still_missing=()
+  for t in "${!tool_pkg[@]}"; do have "$t" || still_missing+=("$t"); done
+  have curl || have wget || still_missing+=(curl)
+  ((${#still_missing[@]} == 0)) || die 2 "Still missing after installation: ${still_missing[*]}"
 else
   echo "All tools present."
 fi
@@ -129,12 +172,14 @@ zip_path="$OUTPUT_DIR/$ZIP_NAME"
 [[ -f $zip_path ]] || die 1 "The builder reported success but $zip_path does not exist."
 zip_sha=$(sha256sum -- "$zip_path" | awk '{print $1}')
 zip_size=$(stat -c %s -- "$zip_path")
+printf '%s  %s\n' "$zip_sha" "$ZIP_NAME" >"$zip_path.sha256"
 
 # -----------------------------------------------------------------------------
 say "4/4  USB drive"
 if [[ -z $USB_DIR ]]; then
-  echo "No --usb given. Copy this file to the USB drive yourself:"
+  echo "No --usb given. Copy BOTH files to the USB drive yourself:"
   echo "  $zip_path"
+  echo "  $zip_path.sha256"
   echo "  SHA256 $zip_sha"
 else
   fstype=""
@@ -153,17 +198,18 @@ else
   printf '%s  %s\n' "$zip_sha" "$ZIP_NAME" >"$USB_DIR/$ZIP_NAME.sha256"
   sync
   echo "Verifying the copy on the USB drive ..."
-  usb_sha=""
-  if usb_sha=$(dd if="$USB_DIR/$ZIP_NAME" iflag=direct bs=4M status=none 2>/dev/null | sha256sum | awk '{print $1}') && [[ -n $usb_sha && $usb_sha != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]]; then
-    :
+  if result=$(uncached_sha256 "$USB_DIR/$ZIP_NAME"); then
+    usb_sha=${result%% *}
+    method=${result#* }
   else
     usb_sha=$(sha256sum -- "$USB_DIR/$ZIP_NAME" | awk '{print $1}')
+    method="page-cache read only - re-check on the H200 with sha256sum -c"
   fi
   [[ $usb_sha == "$zip_sha" ]] || die 6 "The copy on the USB drive is corrupt (SHA256 $usb_sha, expected $zip_sha)." \
     "Try another USB drive or port."
   echo "OK: $USB_DIR/$ZIP_NAME"
   echo "    $USB_DIR/$ZIP_NAME.sha256"
-  echo "    SHA256 $zip_sha (verified on the drive)"
+  echo "    SHA256 $zip_sha ($method)"
   echo "Eject the drive safely before unplugging it, for example:  udisksctl unmount -b <device>  or  umount $USB_DIR"
 fi
 

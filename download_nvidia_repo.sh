@@ -53,7 +53,8 @@ die() {
   exit "$code"
 }
 
-usage() { sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Prints the comment block at the top of this file.
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; }
 
 while (($#)); do
   case $1 in
@@ -94,6 +95,14 @@ valid_deb() {
     [[ $pkg == "$REPO_PACKAGE" ]] || { echo "Package is '$pkg', expected $REPO_PACKAGE"; return 1; }
     [[ $ver == "$REPO_PACKAGE_VERSION" ]] || { echo "Version is '$ver', expected $REPO_PACKAGE_VERSION"; return 1; }
     [[ $arch == "$ARCH" ]] || { echo "Architecture is '$arch', expected $ARCH"; return 1; }
+    # Reads the whole data archive: catches truncated / partially downloaded files.
+    dpkg-deb --fsys-tarfile -- "$f" >/dev/null 2>&1 || { echo "truncated or corrupt (incomplete download?)"; return 1; }
+  elif have ar; then
+    # No dpkg (macOS/other Linux): the ar index must list all three members intact.
+    local members
+    members=$(ar t "$f" 2>/dev/null) || { echo "truncated or corrupt (ar cannot read it)"; return 1; }
+    grep -q '^control\.tar' <<<"$members" && grep -q '^data\.tar' <<<"$members" ||
+      { echo "truncated or corrupt (control/data members missing)"; return 1; }
   fi
   return 0
 }
@@ -121,7 +130,7 @@ Where to put it - keep the file name exactly as it is:
   ${TARGET}
 
 From a browser download, check and file it with:
-  ${SCRIPT_DIR}/download_nvidia_repo.sh --verify ~/Downloads/${DEB}
+  ${SCRIPT_DIR}/download_nvidia_repo.sh --dest "${DEST}" --verify ~/Downloads/${DEB}
 
 Windows PowerShell (then copy the file into the folder above):
   Invoke-WebRequest -Uri "${URLS[0]}" -OutFile "${DEB}"
@@ -133,7 +142,7 @@ http_status() {
   if have curl; then
     curl -s -o /dev/null -I -L --max-time 30 -w '%{http_code}' "$1" 2>/dev/null || true
   else
-    wget --spider --server-response --timeout=30 --tries=1 "$1" 2>&1 | awk '/^  HTTP\//{c=$2} END{print c+0}'
+    wget --spider --server-response --timeout=30 --tries=1 "$1" 2>&1 | awk '/^  HTTP\//{c=$2} END{print c+0}' || true
   fi
 }
 
@@ -151,7 +160,7 @@ diagnose() {
   local url code alt alt_url
   printf '\nDiagnosis:\n'
   for url in "${URLS[@]}"; do
-    code=$(http_status "$url")
+    code=$(http_status "$url") || code=0
     printf '  %-28s %s\n' "$(explain_status "$code")" "$url"
   done
   # Information only - another Ubuntu release is never used instead.

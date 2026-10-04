@@ -62,6 +62,7 @@ NVSWITCHES=()
 PHASE_A_PKGS=()
 PHASE_B_PKGS=()
 PHASE_B_INCOMPLETE=0
+RESULT_OK_MSG="SUCCESS - NVIDIA ${EXPECTED_DRIVER_VERSION} is installed and nvidia-smi works"
 
 # -----------------------------------------------------------------------------
 # Output, logging and the final report
@@ -143,7 +144,7 @@ finish() {
       if ((DRY_RUN)); then
         final_report "SUCCESS (dry run) - all checks passed; nothing was installed or changed"
       else
-        final_report "SUCCESS - NVIDIA ${EXPECTED_DRIVER_VERSION} is installed and nvidia-smi works"
+        final_report "$RESULT_OK_MSG"
       fi
       ;;
     "$E_REBOOT") final_report "ACTION REQUIRED - reboot, then run this installer again (exit code $code)" ;;
@@ -407,9 +408,14 @@ secure_boot_state() {
   local out f val
   if have mokutil && out=$(mokutil --sb-state 2>&1); then
     case $out in
+      *"validation is disabled"*) echo "disabled (validation disabled in shim)"; return ;;
       *"SecureBoot enabled"*) echo enabled; return ;;
       *"SecureBoot disabled"*) echo disabled; return ;;
     esac
+  fi
+  if [[ -e /sys/firmware/efi/efivars/MokSBStateRT-605dab50-e046-4300-abb6-3dd810dd8b23 ]]; then
+    echo "disabled (validation disabled in shim)"
+    return
   fi
   f=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
   if [[ -r $f ]]; then
@@ -487,6 +493,18 @@ Dpkg::Use-Pty "false";
 DPkg::Options:: "--force-confdef";
 DPkg::Options:: "--force-confold";
 EOF
+  if ((REPLACE_EXISTING)); then
+    # Make the bundle's NVIDIA ${EXPECTED_DRIVER_VERSION} packages win over a NEWER installed driver.
+    echo 'APT::Get::Allow-Downgrades "true";' >>"$APT_CONF"
+    RE="$DRIVER_VERSION_RE" awk 'BEGIN { RS = ""; FS = "\n"; re = ENVIRON["RE"] }
+      { p = v = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^Package: /) { p = substr($i, 10) }
+          if ($i ~ /^Version: /) { v = substr($i, 10) }
+        }
+        if (p ~ /^(lib)?nvidia/ && v ~ re) printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n", p, v
+      }' "$PKG_DIR/Packages" >"$a/preferences.d/h200-nvidia-replace.pref"
+  fi
   local out
   if ! out=$(apt-get -c "$APT_CONF" -q --error-on=any update 2>&1); then
     printf '%s\n' "$out"
@@ -517,8 +535,16 @@ plan_packages() {
     PHASE_A_PKGS+=("${sb[@]}")
   fi
   read -r -a PHASE_B_PKGS <<<"${CONF[NVIDIA_PACKAGES]}"
-  if ((${#NVSWITCHES[@]})) && [[ -n ${CONF[NVIDIA_FABRICMANAGER_PACKAGE]:-} ]]; then
-    PHASE_B_PKGS+=("${CONF[NVIDIA_FABRICMANAGER_PACKAGE]}")
+  if ((${#NVSWITCHES[@]})); then
+    if [[ -n ${CONF[NVIDIA_FABRICMANAGER_PACKAGE]:-} ]]; then
+      PHASE_B_PKGS+=("${CONF[NVIDIA_FABRICMANAGER_PACKAGE]}")
+    elif ((DRY_RUN)); then
+      finish "$E_FM" "Fabric Manager" "NVSwitch hardware detected, but nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION} is not in this bundle" \
+        "The real installation would install the driver but end with exit $E_FM (multi-GPU CUDA needs Fabric Manager)." \
+        "Rebuild the bundle with an NVIDIA repository that ships nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION}."
+    else
+      record WARN "Fabric Manager" "NVSwitch present but nvidia-fabricmanager is not in this bundle; the installation will end with exit $E_FM"
+    fi
   fi
 }
 
@@ -545,6 +571,28 @@ simulate_install() {
       finish "$E_CONFLICT" "Package removals" "installing would remove: $removals" \
         "Nothing is removed without consent. Re-run with --replace-existing-driver to allow it."
     fi
+  fi
+  # Every NVIDIA package must end up at ${EXPECTED_DRIVER_VERSION}: APT never replaces a NEWER
+  # installed version by itself, which would otherwise surface later as a confusing DKMS error.
+  declare -A planned=()
+  local n v wrong=()
+  while read -r n v; do planned[$n]=$v; done < <(awk '/^Inst / {
+      n = $2; sub(/:.*/, "", n); l = $0
+      sub(/^Inst [^ ]+ (\[[^]]*\] )?\(/, "", l); sub(/ .*/, "", l); print n, l }' "$sim")
+  for n in "${PHASE_B_PKGS[@]}"; do
+    v=${planned[$n]:-}
+    if [[ -z $v ]] && dpkg-query -W -f='${db:Status-Abbrev}' "$n" 2>/dev/null | grep -q '^.i'; then
+      v=$(dpkg-query -W -f='${Version}' "$n" 2>/dev/null || true)
+    fi
+    [[ $v =~ $DRIVER_VERSION_RE ]] || wrong+=("$n ${v:-(not installable)}")
+  done
+  if ((${#wrong[@]})); then
+    if ((REPLACE_EXISTING)); then
+      finish "$E_CONFLICT" "NVIDIA versions" "even with --replace-existing-driver these packages would not end at ${EXPECTED_DRIVER_VERSION}: ${wrong[*]}" \
+        "Remove the other NVIDIA driver first (for example: sudo apt-get purge 'nvidia-*' 'libnvidia-*'), reboot, then run this installer again."
+    fi
+    finish "$E_CONFLICT" "NVIDIA versions" "these installed NVIDIA packages are newer/different and would be kept: ${wrong[*]}" \
+      "To downgrade/replace them with ${EXPECTED_DRIVER_VERSION}, run: sudo bash ./$(basename -- "$0") --replace-existing-driver"
   fi
   record PASS "Dependencies" "all dependencies satisfiable offline ($(grep -c '^Inst ' "$sim") package(s) to install/upgrade)"
 }
@@ -581,6 +629,7 @@ install_kernel_mode() {
   read -r -a pkgs <<<"${CONF[KERNEL_IMAGE_PACKAGES]}"
   pkgs+=("linux-headers-${abis[0]}")
   if [[ $(running_kernel) == "${abis[0]}" ]]; then
+    RESULT_OK_MSG="SUCCESS - kernel ${abis[0]} is already running; the NVIDIA driver is NOT installed yet - run the installer without --install-kernel"
     finish "$E_OK" "Kernel installation" "already running ${abis[0]}; run the installer without --install-kernel"
   fi
   local sim="$TMP_DIR/kernel-sim.txt"
@@ -717,7 +766,13 @@ check_module_signing() {
     record PASS "Module signing" "not required (Secure Boot ${SB_STATE})"
     return 0
   fi
-  local signer cert out
+  local signer cert out lockdown="" sig_enforce=""
+  [[ -r /sys/kernel/security/lockdown ]] && lockdown=$(</sys/kernel/security/lockdown)
+  [[ -r /sys/module/module/parameters/sig_enforce ]] && sig_enforce=$(</sys/module/module/parameters/sig_enforce)
+  if [[ $lockdown == *"[none]"* && $sig_enforce == N ]]; then
+    record PASS "Module signing" "Secure Boot is on but this kernel does not enforce module signatures (lockdown none, sig_enforce N)"
+    return 0
+  fi
   signer=$(modinfo -k "$KREL" -F signer nvidia 2>/dev/null || true)
   cert=$(dkms_mok_certificate)
   if [[ -z $signer ]]; then
@@ -759,7 +814,9 @@ handle_nouveau() {
     record PASS "nouveau" "nouveau was loaded and has been unloaded"
     return 0
   fi
-  if ! modprobe --showconfig 2>/dev/null | grep -qE '^blacklist nouveau$'; then
+  local modcfg
+  modcfg=$(modprobe --showconfig 2>/dev/null || true)
+  if ! grep -qE '^blacklist nouveau$' <<<"$modcfg"; then
     printf '# Written by install_h200_nvidia_offline.sh: nouveau must not claim the NVIDIA H200.\nblacklist nouveau\noptions nouveau modeset=0\n' >"$NOUVEAU_BLACKLIST"
     info "Created $NOUVEAU_BLACKLIST"
   fi
@@ -802,8 +859,12 @@ load_driver() {
           "See the kernel messages above." ;;
     esac
   fi
-  if ! modprobe nvidia_uvm 2>/dev/null; then
-    record WARN "nvidia_uvm" "nvidia_uvm could not be loaded (CUDA applications need it)"
+  local uvm_out
+  if ! uvm_out=$(modprobe nvidia_uvm 2>&1); then
+    printf '%s\n' "$uvm_out"
+    dmesg 2>/dev/null | grep -iE 'nvidia|nvrm|uvm' | tail -n 20 || true
+    finish "$E_LOAD" "nvidia_uvm" "the CUDA unified memory module nvidia_uvm failed to load: ${uvm_out:-no message}" \
+      "CUDA compute needs nvidia_uvm. See the kernel messages above."
   fi
   local procver=""
   [[ -r /proc/driver/nvidia/version ]] && procver=$(head -n1 /proc/driver/nvidia/version)
@@ -858,19 +919,22 @@ run_nvidia_smi() {
   fi
   timeout 300 nvidia-smi -q 2>&1 | log_only || true
 
-  local q
-  q=$(timeout 120 nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,memory.total --format=csv,noheader 2>&1) ||
-    finish "$E_SMI" "nvidia-smi" "nvidia-smi --query-gpu failed: $q"
-  printf '%s\n' "$q" | sed 's/^/  GPU /'
+  local q rows smierr="$TMP_DIR/nvidia-smi-query.err"
+  q=$(timeout 120 nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,memory.total --format=csv,noheader 2>"$smierr") ||
+    finish "$E_SMI" "nvidia-smi" "nvidia-smi --query-gpu failed: $(cat -- "$smierr" 2>/dev/null) $q"
+  if [[ -s $smierr ]]; then { printf -- '---- nvidia-smi --query-gpu stderr ----\n'; cat -- "$smierr"; } | log_only; fi
+  rows=$(grep -E '^[0-9]+, ' <<<"$q" || true)
+  [[ -n $rows ]] || finish "$E_SMI" "nvidia-smi" "nvidia-smi --query-gpu returned no GPU rows: $q"
+  printf '%s\n' "$rows" | sed 's/^/  GPU /'
   local total h200 badver
-  total=$(grep -c . <<<"$q" || true)
-  h200=$(grep -cE '(^|[^G])H200' <<<"$q" || true)
-  badver=$(awk -F', *' -v v="$EXPECTED_DRIVER_VERSION" '$4 != v' <<<"$q" | grep -c . || true)
+  total=$(grep -c . <<<"$rows" || true)
+  h200=$(grep -cE '(^|[^G])H200' <<<"$rows" || true)
+  badver=$(awk -F', *' -v v="$EXPECTED_DRIVER_VERSION" '$4 != v' <<<"$rows" | grep -c . || true)
   ((badver == 0)) || finish "$E_SMI" "nvidia-smi" "nvidia-smi reports a driver version other than ${EXPECTED_DRIVER_VERSION}"
   record PASS "nvidia-smi" "driver ${EXPECTED_DRIVER_VERSION}, ${total} GPU(s) visible"
   if ((h200 == 0)); then
     finish "$E_NOH200" "H200 detection" "no NVIDIA H200 among the GPUs reported by nvidia-smi" \
-      "GPUs found: $(cut -d, -f2 <<<"$q" | sed 's/^ *//' | sort | uniq -c | tr -s ' ' | tr '\n' ';')" \
+      "GPUs found: $(cut -d, -f2 <<<"$rows" | sed 's/^ *//' | sort | uniq -c | tr -s ' ' | tr '\n' ';')" \
       "The driver itself is installed and working."
   fi
   record PASS "H200 detection" "${h200} x NVIDIA H200 detected"

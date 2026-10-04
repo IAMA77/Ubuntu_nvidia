@@ -67,7 +67,12 @@ It runs these four steps and stops with a clear message if any step fails:
 1. **Tools.** Installs `curl zip unzip xz-utils` with `sudo apt-get` if they are missing.
 2. **NVIDIA file.** Runs `download_nvidia_repo.sh`, which downloads `nvidia-driver-local-repo-ubuntu2604-615.71.09_1.0-1_amd64.deb` into `nvidia-downloads/`. A valid copy already there is reused.
 3. **Build.** Runs `build_h200_nvidia_offline_bundle.sh`, which downloads every Ubuntu package and builds and validates the ZIP.
-4. **USB.** Copies the ZIP and `<ZIP>.sha256` to the USB drive and re-checks the SHA256 on the drive. It refuses a path that is not a mounted drive, and refuses a FAT32 drive if the ZIP is 4 GiB or larger.
+4. **USB.** Copies the ZIP and `<ZIP>.sha256` to the USB drive and checks the copy's SHA256.
+   * It reads the copy back from the drive itself, not from the page cache: `gnudd iflag=direct` if possible, otherwise it evicts the file from the cache first, and it says which method was used.
+   * It refuses a path on the system disk, on tmpfs/overlay or not on a `/dev` block device.
+   * It refuses a FAT32 drive if the ZIP is 4 GiB or larger.
+
+   The `<ZIP>.sha256` file is also written next to the ZIP in the output directory, so you have it even without `--usb`.
 
 When it prints `READY`, nothing else has to be downloaded. Eject the drive and take it to the H200.
 
@@ -79,8 +84,8 @@ sudo apt-get update
 sudo apt-get install -y git curl zip unzip xz-utils
 
 # Get the scripts (or copy the .sh files into one folder)
-git clone https://github.com/IAMA77/h200-nvidia-offline-bundle.git
-cd h200-nvidia-offline-bundle
+git clone https://github.com/IAMA77/Ubuntu_nvidia.git
+cd Ubuntu_nvidia
 
 # NVIDIA file (optional: the builder downloads it itself if it is missing)
 ./download_nvidia_repo.sh
@@ -93,7 +98,8 @@ cd h200-nvidia-offline-bundle
 
 # Result
 ls -lh H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip
-sha256sum H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip   # write this down, re-check it after copying
+sha256sum H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip | tee H200_NVIDIA_615.71.09_Ubuntu26.04_Offline.zip.sha256
+# copy BOTH the .zip and the .zip.sha256 to the USB drive
 ```
 
 Builder options:
@@ -188,12 +194,16 @@ cat /proc/driver/nvidia/version                   # "NVIDIA UNIX Open Kernel Mod
 ```
 
 Installer options: `--dry-run`, `--replace-existing-driver`, `--skip-gpu-check`, `--install-kernel`.
+With `--replace-existing-driver` the bundle's 615.71.09 packages are pinned so APT also
+downgrades a *newer* installed NVIDIA driver; without it, any other driver version stops
+the installer (exit 13) before anything is changed.
 The log is written to `install.log` in the bundle directory, or to
 `/var/log/h200_nvidia_offline_install.log` if that directory is read-only.
 
 | Exit | Meaning | Exit | Meaning |
 |---|---|---|---|
 | 0 | success | 21 | kernel headers missing |
+| 1 | unexpected error (see `install.log`) | | |
 | 2 | bad usage / not root | 30 | DKMS build failure |
 | 3 | reboot required (nouveau in use, old module loaded, kernel installed) | 31 | Secure Boot / module signing / MOK not enrolled |
 | 10 | wrong Ubuntu version or architecture | 32 | NVIDIA module failed to load |
@@ -282,10 +292,14 @@ configured before the NVIDIA DKMS package builds the module:
 
 ## 5. Verification procedure: why `nvidia-smi` will work without Internet
 
-1. **Builder validation (online, before the ZIP exists).** The build fails if any check fails.
+1. **Builder validation (online, before the ZIP exists).** These are hard checks; the build fails if any of them fails:
    * A second private APT environment whose **only** source is the bundle's `packages/` directory simulates the complete installation for **each** kernel ABI on a bare system: toolchain + `gcc-NN` + `linux-headers-<abi>` + NVIDIA packages. Success proves every dependency is inside the bundle.
-   * The same simulation runs against the build machine's real Ubuntu 26.04 package state, and against the H200's state if one was captured.
-   * One version per package (no duplicates); only `amd64`/`all` packages (no `amd64v3`, `arm64`, `i386`); no NVIDIA package of any other driver version; all requested NVIDIA packages present at `615.71.09`; headers, common headers, compiler and toolchain present; all bundled packages co-installable.
+   * With `--target-state`, the same simulation runs against the H200's captured package database. It must succeed without removing any non-NVIDIA package.
+   * One version per package (no duplicates); only `amd64`/`all` packages (no `amd64v3`, `arm64`, `i386`); no NVIDIA package of any other driver version; all requested NVIDIA packages present at `615.71.09`; headers, common headers, compiler and toolchain present.
+
+   Two further checks are informational and only print a warning:
+   * the simulation against the build machine's own package state (that machine is not the H200);
+   * whether *all* bundled packages can be installed at the same time.
    * NVIDIA payload present: `dkms.conf`, `nvidia-smi`, GSP firmware, NVML, `libcuda`.
    * `SHA256SUMS` written and re-verified; ZIP integrity tested; required files present in the ZIP.
 2. **On the H200, before changing anything:** `sudo bash ./install_h200_nvidia_offline.sh --dry-run`. It verifies:
@@ -302,7 +316,7 @@ configured before the NVIDIA DKMS package builds the module:
    * `depmod` runs;
    * `modinfo` shows version `615.71.09` with license `Dual MIT/GPL` (the open module);
    * with Secure Boot, the module is signed and the MOK is enrolled;
-   * `modprobe nvidia`/`nvidia_uvm` succeed;
+   * `modprobe nvidia` and `modprobe nvidia_uvm` (needed by CUDA) both succeed; a failure of either is exit 32;
    * `/proc/driver/nvidia/version` shows `Open Kernel Module ... 615.71.09`;
    * Fabric Manager is active if NVSwitches are present;
    * `nvidia-smi` succeeds, every GPU reports driver `615.71.09`, and at least one `NVIDIA H200` is listed.
@@ -333,11 +347,30 @@ The scripts were exercised in this repository's development environment as follo
 * **Builder.** Run inside a real Ubuntu 26.04 (`resolute`) userland, against the live official Ubuntu archive. Both root and a normal user were tested. Kernel ABI discovery, common-header discovery, the gcc-15 detection, the full dependency resolution, the downloads, the validation and the ZIP creation all ran for real. That covered a single ABI, all ten `7.0.0-NN-generic` ABIs, `--target-state` and `--with-kernel-image`. The refusal paths were tested too: a non-existent kernel family, a non-existent exact ABI, a wrong NVIDIA filename, and a missing NVIDIA package.
 * **Installer.** Run on a fresh minimal Ubuntu 26.04 system **with networking removed**. It installed GCC 15, DKMS, and the real `linux-headers-7.0.0-38-generic` from the bundle only. DKMS then compiled a kernel module against those headers, and `depmod`/`modinfo` checks passed. Also tested: re-run idempotency, wrong-kernel detection, corrupt-package detection, non-root dry-run and `--install-kernel --dry-run`.
 * **Automation tested.**
-  * `prepare_h200_usb.sh` end to end, with a mounted drive: the SHA256 was re-verified on the drive, and a non-mounted path was refused.
+  * `prepare_h200_usb.sh` end to end, with a mounted drive. The SHA256 was re-verified with an uncached read. Paths on the system disk and on tmpfs were refused.
   * The `nvidia-downloads/` drop folder: reused without re-downloading, and a corrupt `.sha256` was rejected.
   * `download_nvidia_repo.sh --verify`: a wrong file name and an HTML error page saved as `.deb` were both rejected.
   * The no-network failure path, which prints the diagnosis, the links and the target path.
   * The content-based search: with `nvidia-smi` and the GSP firmware in unexpected packages, both were found and added.
+* **Independent review.** A multi-agent review with five lenses checked the scripts:
+  1. Bash correctness;
+  2. the original specification;
+  3. installer behaviour on real hardware;
+  4. APT/bundle logic;
+  5. documentation.
+
+  Each finding was adversarially verified, and the confirmed issues were fixed and re-tested. Those tests covered:
+  * an uncached USB read via `gnudd iflag=direct`, and refusal of tmpfs;
+  * rejection of truncated NVIDIA downloads;
+  * the wget-only diagnosis path;
+  * guards against `/` or the output directory being used as the work directory;
+  * `--replace-existing-driver` downgrading a newer installed driver (and exit 13 without the flag);
+  * `nvidia-smi` parsing with stderr warnings, GH200-only GPUs (exit 41) and a wrong driver version (exit 40);
+  * Secure Boot with shim validation disabled.
+
+  A final full run of `prepare_h200_usb.sh` built the bundle and wrote it to the USB drive. On a fresh Ubuntu 26.04 target with no network, `sha256sum -c` passed, the dry-run passed, and the install passed every check up to loading the module.
 * **Not possible there.** NVIDIA's servers (download, docs and developer sites) are blocked by that environment's network policy. A test-only stand-in for the NVIDIA local repository package was used instead: same layout, same signing scheme. Loading the module and running `nvidia-smi` need the H200 itself.
 
-  If NVIDIA has not published `615.71.09` for `ubuntu2604` at the URLs above, or names the packages differently from the table in step 7, the builder stops and says exactly what is unavailable. In that case download the file manually from nvidia.com and use `--nvidia-repo-deb`.
+  Two cases make the builder stop and say exactly what is unavailable:
+  * **The file isn't published at the URLs above.** Download it manually from NVIDIA's download page, put it into `nvidia-downloads/` (or pass `--nvidia-repo-deb`), and run again.
+  * **The required packages have unexpected names.** The error lists the similar names that do exist in NVIDIA's repository. Add the real name to `role_candidates()` in the builder. Re-downloading the same file will not help. Missing `nvidia-smi`, firmware or library files are already found by content automatically.

@@ -94,7 +94,7 @@ while (($#)); do
 done
 OUTPUT_DIR=${OUTPUT_DIR:-$PWD}
 [[ $OUTPUT_DIR == /* ]] || OUTPUT_DIR="$PWD/$OUTPUT_DIR"
-OUTPUT_DIR=$(realpath -m -s -- "$OUTPUT_DIR")
+OUTPUT_DIR=$(realpath -m -s -- "$OUTPUT_DIR" 2>/dev/null || printf '%s' "$OUTPUT_DIR")
 
 for f in build_h200_nvidia_offline_bundle.sh "$INSTALLER_NAME" capture_target_state.sh download_nvidia_repo.sh; do
   [[ -f $SCRIPT_DIR/$f ]] || die 2 "$f must be in the same folder as prepare_h200_usb.sh ($SCRIPT_DIR)"

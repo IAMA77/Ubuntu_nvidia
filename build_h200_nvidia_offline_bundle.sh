@@ -506,7 +506,11 @@ check_build_host() {
   parent=$(dirname -- "$WORKDIR")
   mkdir -p -- "$parent" "$OUTPUT_DIR" 2>/dev/null || true
   [[ -d $OUTPUT_DIR && -w $OUTPUT_DIR ]] || die "The output directory $OUTPUT_DIR cannot be created or is not writable."
-  [[ -d $parent && -w $parent ]] || die "Cannot create the working directory under $parent (not writable)."
+  if [[ -d $WORKDIR ]]; then
+    [[ -w $WORKDIR ]] || die "The working directory $WORKDIR is not writable."
+  else
+    [[ -d $parent && -w $parent ]] || die "Cannot create the working directory under $parent (not writable)."
+  fi
   free_kib=$(df -Pk -- "$parent" | awk 'NR==2 {print $4}')
   if [[ $free_kib =~ ^[0-9]+$ ]] && ((free_kib < MIN_FREE_KIB)); then
     die "Not enough free disk space in $parent: $((free_kib / 1024)) MiB free, at least $((MIN_FREE_KIB / 1024)) MiB needed."
@@ -1803,8 +1807,9 @@ validate_bundle() {
     out="$WORKDIR/verify-h200-state.txt"
     if simulate_bundle_only "$TARGET_STATUS" "$out" "${base[@]}" "${KERNEL_GCC_PKG[$abi]}" "linux-headers-$abi"; then
       local removed_other removed_nv
-      removed_other=$(awk '/^Remv / && $2 !~ /^(lib)?nvidia/ { printf "%s ", $2 }' "$out")
-      removed_nv=$(awk '/^Remv / && $2 ~ /^(lib)?nvidia/ { printf "%s ", $2 }' "$out")
+      local nv_re='^((lib)?nvidia|linux-(modules|objects|signatures)-nvidia-|xserver-xorg-video-nvidia)'
+      removed_other=$(NV_RE=$nv_re awk '/^Remv / && $2 !~ ENVIRON["NV_RE"] { printf "%s ", $2 }' "$out")
+      removed_nv=$(NV_RE=$nv_re awk '/^Remv / && $2 ~ ENVIRON["NV_RE"] { printf "%s ", $2 }' "$out")
       if [[ -n $removed_other ]]; then
         vfail "On the captured H200 the installation would REMOVE non-NVIDIA packages: $removed_other(upgrade or remove them on the H200 first, e.g. foreign-architecture :i386 packages)"
       else
@@ -1880,6 +1885,11 @@ create_zip() {
   ok "ZIP integrity test passed; installer, manifest, README, SHA256SUMS and ${debs_in_zip} packages present"
   if [[ -e $OUTPUT_DIR/$ZIP_NAME ]]; then info "Replacing existing $OUTPUT_DIR/$ZIP_NAME"; fi
   mv -f -- "$tmpzip" "$OUTPUT_DIR/$ZIP_NAME"
+  if [[ -f $OUTPUT_DIR/$ZIP_NAME.sha256 ]]; then
+    # A checksum file from an earlier prepare_h200_usb.sh run would now be stale.
+    (cd -- "$OUTPUT_DIR" && sha256sum -- "$ZIP_NAME") >"$OUTPUT_DIR/$ZIP_NAME.sha256"
+    info "Updated $OUTPUT_DIR/$ZIP_NAME.sha256"
+  fi
 }
 
 summary() {

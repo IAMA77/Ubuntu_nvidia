@@ -80,6 +80,23 @@ sha256_file() {
 
 human_size() { awk -v b="$(wc -c <"$1" | tr -d ' ')" 'BEGIN { printf "%.1f MiB", b / 1048576 }'; }
 
+# Walks the 60-byte 'ar' member headers of a .deb; succeeds only if there are at least
+# three members (debian-binary, control.tar.*, data.tar.*) and their sizes add up exactly
+# to the file size, i.e. nothing was cut off.
+ar_layout_ok() {
+  local f=$1 total off=8 size=0 members=0
+  total=$(wc -c <"$f" | tr -d ' ')
+  while ((off < total)); do
+    ((off + 60 <= total)) || return 1
+    size=$(tail -c +$((off + 49)) -- "$f" 2>/dev/null | head -c 10 | tr -d ' ' || true)
+    [[ $size =~ ^[0-9]+$ ]] || return 1
+    off=$((off + 60 + size + size % 2))
+    members=$((members + 1))
+  done
+  # Exact end, or only the 1-byte padding after an odd-sized last member is missing (content intact).
+  ((members >= 3 && (off == total || (off == total + 1 && size % 2 == 1))))
+}
+
 # A .deb is an 'ar' archive whose first member is "debian-binary". When dpkg-deb
 # is available (Ubuntu/Debian/WSL) the control fields are checked as well.
 valid_deb() {
@@ -97,12 +114,14 @@ valid_deb() {
     [[ $arch == "$ARCH" ]] || { echo "Architecture is '$arch', expected $ARCH"; return 1; }
     # Reads the whole data archive: catches truncated / partially downloaded files.
     dpkg-deb --fsys-tarfile -- "$f" >/dev/null 2>&1 || { echo "truncated or corrupt (incomplete download?)"; return 1; }
-  elif have ar; then
-    # No dpkg (macOS/other Linux): the ar index must list all three members intact.
-    local members
-    members=$(ar t "$f" 2>/dev/null) || { echo "truncated or corrupt (ar cannot read it)"; return 1; }
-    grep -q '^control\.tar' <<<"$members" && grep -q '^data\.tar' <<<"$members" ||
-      { echo "truncated or corrupt (control/data members missing)"; return 1; }
+  else
+    # No dpkg (macOS / other Linux): the ar member sizes must add up exactly to the file size.
+    ar_layout_ok "$f" || { echo "truncated or corrupt (incomplete download?)"; return 1; }
+    if have ar; then
+      local data
+      data=$(ar t "$f" 2>/dev/null | grep -m1 '^data\.tar' || true)
+      [[ -n $data ]] && ar p "$f" "$data" >/dev/null 2>&1 || { echo "truncated or corrupt (data member unreadable)"; return 1; }
+    fi
   fi
   return 0
 }

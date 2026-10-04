@@ -69,7 +69,7 @@ It runs these four steps and stops with a clear message if any step fails:
 3. **Build.** Runs `build_h200_nvidia_offline_bundle.sh`, which downloads every Ubuntu package and builds and validates the ZIP.
 4. **USB.** Copies the ZIP and `<ZIP>.sha256` to the USB drive and checks the copy's SHA256.
    * It reads the copy back from the drive itself, not from the page cache: `gnudd iflag=direct` if possible, otherwise it evicts the file from the cache first, and it says which method was used.
-   * It refuses a path on the system disk, on tmpfs/overlay or not on a `/dev` block device.
+   * It refuses a path on the root file system, on tmpfs/overlay or not on a `/dev` block device. Make sure you pass the USB drive's mount point (`lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS`).
    * It refuses a FAT32 drive if the ZIP is 4 GiB or larger.
 
    The `<ZIP>.sha256` file is also written next to the ZIP in the output directory, so you have it even without `--usb`.
@@ -294,14 +294,14 @@ configured before the NVIDIA DKMS package builds the module:
 
 1. **Builder validation (online, before the ZIP exists).** These are hard checks; the build fails if any of them fails:
    * A second private APT environment whose **only** source is the bundle's `packages/` directory simulates the complete installation for **each** kernel ABI on a bare system: toolchain + `gcc-NN` + `linux-headers-<abi>` + NVIDIA packages. Success proves every dependency is inside the bundle.
-   * With `--target-state`, the same simulation runs against the H200's captured package database. It must succeed without removing any non-NVIDIA package.
+   * With `--target-state`, the same simulation runs against the H200's captured package database. It must succeed without removing any package other than NVIDIA driver packages, which include Ubuntu's prebuilt `linux-modules-nvidia-*`; those are replaced on the H200 with `--replace-existing-driver`.
    * One version per package (no duplicates); only `amd64`/`all` packages (no `amd64v3`, `arm64`, `i386`); no NVIDIA package of any other driver version; all requested NVIDIA packages present at `615.71.09`; headers, common headers, compiler and toolchain present.
+   * NVIDIA payload present: `dkms.conf`, `nvidia-smi`, GSP firmware, NVML, `libcuda`.
+   * `SHA256SUMS` written and re-verified; ZIP integrity tested; required files present in the ZIP.
 
    Two further checks are informational and only print a warning:
    * the simulation against the build machine's own package state (that machine is not the H200);
    * whether *all* bundled packages can be installed at the same time.
-   * NVIDIA payload present: `dkms.conf`, `nvidia-smi`, GSP firmware, NVML, `libcuda`.
-   * `SHA256SUMS` written and re-verified; ZIP integrity tested; required files present in the ZIP.
 2. **On the H200, before changing anything:** `sudo bash ./install_h200_nvidia_offline.sh --dry-run`. It verifies:
    * the OS, architecture, and every SHA256;
    * that `uname -r` is one of the bundled ABIs;
@@ -316,7 +316,7 @@ configured before the NVIDIA DKMS package builds the module:
    * `depmod` runs;
    * `modinfo` shows version `615.71.09` with license `Dual MIT/GPL` (the open module);
    * with Secure Boot, the module is signed and the MOK is enrolled;
-   * `modprobe nvidia` and `modprobe nvidia_uvm` (needed by CUDA) both succeed; a failure of either is exit 32;
+   * `modprobe nvidia` and `modprobe nvidia_uvm` (needed by CUDA) both succeed. A failure exits 32, or 31 (Secure Boot key rejected), 41 (no usable GPU) or 3 (an old module still loaded, reboot needed);
    * `/proc/driver/nvidia/version` shows `Open Kernel Module ... 615.71.09`;
    * Fabric Manager is active if NVSwitches are present;
    * `nvidia-smi` succeeds, every GPU reports driver `615.71.09`, and at least one `NVIDIA H200` is listed.

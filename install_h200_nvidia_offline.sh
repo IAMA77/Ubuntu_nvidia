@@ -62,6 +62,7 @@ NVSWITCHES=()
 PHASE_A_PKGS=()
 PHASE_B_PKGS=()
 PHASE_B_INCOMPLETE=0
+FM_MISSING=0
 RESULT_OK_MSG="SUCCESS - NVIDIA ${EXPECTED_DRIVER_VERSION} is installed and nvidia-smi works"
 
 # -----------------------------------------------------------------------------
@@ -539,9 +540,8 @@ plan_packages() {
     if [[ -n ${CONF[NVIDIA_FABRICMANAGER_PACKAGE]:-} ]]; then
       PHASE_B_PKGS+=("${CONF[NVIDIA_FABRICMANAGER_PACKAGE]}")
     elif ((DRY_RUN)); then
-      finish "$E_FM" "Fabric Manager" "NVSwitch hardware detected, but nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION} is not in this bundle" \
-        "The real installation would install the driver but end with exit $E_FM (multi-GPU CUDA needs Fabric Manager)." \
-        "Rebuild the bundle with an NVIDIA repository that ships nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION}."
+      FM_MISSING=1
+      record FAIL "Fabric Manager" "NVSwitch present but nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION} is not in this bundle"
     else
       record WARN "Fabric Manager" "NVSwitch present but nvidia-fabricmanager is not in this bundle; the installation will end with exit $E_FM"
     fi
@@ -576,12 +576,13 @@ simulate_install() {
   # installed version by itself, which would otherwise surface later as a confusing DKMS error.
   declare -A planned=()
   local n v wrong=()
-  while read -r n v; do planned[$n]=$v; done < <(awk '/^Inst / {
+  while read -r n v; do planned[$n]=$v; done < <(awk '/^(Inst|Conf) / {
       n = $2; sub(/:.*/, "", n); l = $0
-      sub(/^Inst [^ ]+ (\[[^]]*\] )?\(/, "", l); sub(/ .*/, "", l); print n, l }' "$sim")
+      sub(/^(Inst|Conf) [^ ]+ (\[[^]]*\] )?\(/, "", l); sub(/ .*/, "", l); print n, l }' "$sim")
   for n in "${PHASE_B_PKGS[@]}"; do
     v=${planned[$n]:-}
-    if [[ -z $v ]] && dpkg-query -W -f='${db:Status-Abbrev}' "$n" 2>/dev/null | grep -q '^.i'; then
+    # Any present state counts (installed, unpacked, half-configured after a failed DKMS build, ...).
+    if [[ -z $v ]] && dpkg-query -W -f='${db:Status-Abbrev}' "$n" 2>/dev/null | grep -q '^.[iUFHWt]'; then
       v=$(dpkg-query -W -f='${Version}' "$n" 2>/dev/null || true)
     fi
     [[ $v =~ $DRIVER_VERSION_RE ]] || wrong+=("$n ${v:-(not installable)}")
@@ -976,6 +977,11 @@ main() {
   if ((DRY_RUN)); then
     record INFO "Planned phase A" "${PHASE_A_PKGS[*]}"
     record INFO "Planned phase B" "${PHASE_B_PKGS[*]}"
+    if ((FM_MISSING)); then
+      finish "$E_FM" "Dry run" "everything else is ready, but this NVSwitch (HGX) system needs nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION}, which is not in this bundle" \
+        "A real installation would install the driver and then end with exit $E_FM (multi-GPU CUDA needs Fabric Manager)." \
+        "Rebuild the bundle from an NVIDIA repository that ships nvidia-fabricmanager ${EXPECTED_DRIVER_VERSION}."
+    fi
     finish "$E_OK" "Dry run" "the system and the bundle are ready; nothing was changed"
   fi
 
